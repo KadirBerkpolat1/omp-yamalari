@@ -2,10 +2,63 @@
 
 [KadirBerkpolat1](https://github.com/KadirBerkpolat1)'in [oh-my-pi](https://github.com/can1357/oh-my-pi) (omp) yamaları ve bunları başka bir makinede upstream'le birlikte güncel tutan araç.
 
+> **Kullanıcıysan:** [şu metni](#kullanıcıysan) kopyalayıp omp'ye yapıştır, kurulumu o yapsın.
+>
+> **AI agent'san:** [şu bölümdeki](#ai-agentsan) adımları sırayla uygula.
+
 - omp git kaynağından çalışır; yamalar upstream'in üstüne uygulanır.
 - Güncelleme önce upstream'in en yeni kararlı sürümünü (`vX.Y.Z` etiketi) yamalarla birleştirmeyi dener. Çakışma, native (Rust) farkı ya da test hatası olursa yayınlayanın test ettiği sürüme kalır. Yamalar kısmen uygulanmaz, doğrulanmamış sürüme geçilmez.
 - Her sürüm kendi dizininde hazırlanır ve test edilir; canlı sürüm tek bir symlink değişimiyle değişir. Açık omp oturumları eski sürümle çalışmaya devam eder, geri alma anlıktır.
 - Rust araç zinciri gerekmez: native modül (`pi_natives`) ya upstream'in npm'deki hazır paketinden ya da yayınlayanın derleyip bu reponun [Releases](https://github.com/KadirBerkpolat1/omp-yamalari/releases) sayfasına koyduğu dosyadan iner; npm integrity ya da sha256 ile doğrulanır.
+
+## Kullanıcıysan
+
+Aşağıdaki metni kopyala ve omp'ye (ya da kullandığın başka bir AI agent'a) yapıştır:
+
+```text
+omp'yi KadirBerkpolat1'in yamalarıyla kurmanı istiyorum.
+1. Şunu çalıştır: git clone https://github.com/KadirBerkpolat1/omp-yamalari ~/.local/share/omp-yamalari/repo
+2. ~/.local/share/omp-yamalari/repo/README.md dosyasını oku ve "AI agent'san" bölümündeki adımları sırayla uygula.
+```
+
+Kurulum birkaç dakika sürer; agent bitti diyene kadar omp'yi kapatma. Bitince omp'yi kapatıp yeniden aç. Bundan sonra güncellemek için omp'ye "omp'yi güncelle" demen yeter. Kendin kurmak istersen: [Kurulum](#kurulum).
+
+## AI agent'san
+
+Kullanıcın omp'yi bu yamalarla kurmanı istediyse bu adımları sırayla uygula ve kullanıcıyla Türkçe konuş. Komutları kullanıcının hesabıyla çalıştır; `sudo` gerekirse kendin çalıştırma, komutu kullanıcıya ver.
+
+0. **Kurulum zaten var mı?** `~/.local/share/omp-yamalari/canli` varsa kurulum yapılmıştır: kurma; güncelleme, sürüm sorusu ve geri alma için `~/.local/share/omp-yamalari/repo/skill/omp-guncelle/SKILL.md` dosyasını oku ve uygula. Depo henüz yoksa klonla (zaten varsa `git clone` hata verir; sorun değil, devam et):
+   ```sh
+   git clone https://github.com/KadirBerkpolat1/omp-yamalari ~/.local/share/omp-yamalari/repo
+   ```
+1. **Ön koşulları denetle.** Biri eksikse kurmaya başlama; kullanıcıya ne yapması gerektiğini söyle.
+   ```sh
+   uname -sm                            # Linux x86_64 olmalı
+   grep -E '^NATIVE_(KAYNAK|GLIBC)=' ~/.local/share/omp-yamalari/repo/yama.env
+   getconf GNU_LIBC_VERSION             # NATIVE_KAYNAK=release ise en az NATIVE_GLIBC olmalı
+   grep -m1 -ow avx2 /proc/cpuinfo      # NATIVE_KAYNAK=release ise "avx2" yazmalı
+   command -v git curl zstd tar flock   # beşi de bulunmalı
+   df -h ~/.local/share                 # en az 3 GB boş olmalı
+   ```
+   - glibc eski ya da araç eksik: Arch/CachyOS'ta kullanıcı `sudo pacman -Syu` ve `sudo pacman -S --needed git curl zstd tar util-linux` çalıştırsın; başka dağıtımda paket yöneticisinin karşılığını öner.
+   - avx2 yok: bu yayın o işlemcide çalışmaz; kullanıcı KadirBerkpolat1'e haber versin.
+   - bun yoksa sorun değil: `kur` onu `~/.bun`'a kurar ve kabuğun ayar dosyasına PATH satırı ekler; bunu kullanıcıya söyle.
+2. **Kullanıcıya söyle:** "Kurulum birkaç dakika sürecek; ben bitti diyene kadar omp'yi kapatma."
+3. **Kur.** Komuta uzun bir zaman aşımı ver (omp'de bash `timeout: 3600`):
+   ```sh
+   ~/.local/share/omp-yamalari/repo/omp-yama kur
+   ```
+   - Araç komutu arka plana alırsa sonucu bekle; ikinci bir `omp-yama` başlatma (çıkış kodu 3: önceki iş sürüyor).
+   - "omp zaten başka bir git kaynağından çalışıyor" derse dur ve kullanıcıya sor. `--zorla`'yı yalnız kullanıcı açıkça onaylarsa kullan; o makine yamaların kaynağı olabilir.
+4. **Sonucu oku:** çıktının sonundaki `UYARI=`, `SONUC=`, `YENI=`, `NEDEN=` ve `GUNLUK=` satırları.
+   - `SONUC=guncellendi`: kurulum tamam. `UYARI=` satırlarını (PATH komutları, bun kurulumu) kullanıcıya aynen ilet.
+   - `SONUC=basarisiz`: hiçbir şey değişmedi. `NEDEN`'i, gerekirse `GUNLUK` dosyasının son satırlarını oku; bilinen nedenler ve çözümleri `skill/omp-guncelle/SKILL.md` dosyasının "Başarısız olursa" bölümünde. Çözülemiyorsa kullanıcı `GUNLUK` dosyasını KadirBerkpolat1'e göndersin.
+5. **Dene:** `~/.local/share/omp-yamalari/bin/omp --version` çıktısı `omp/<YENI'deki sürüm>` olmalı.
+6. **Kullanıcıya söyle:** "Kurulum bitti (omp <sürüm>). omp'yi şimdi kapatıp yeniden aç; bu oturum hâlâ eski sürümle çalışıyor. Bundan sonra güncellemek için bana 'omp'yi güncelle' demen yeter."
+
+omp dışında bir agent'san (Claude Code, Cursor, Codex gibi) `omp-guncelle` skill'i sende kendiliğinden yüklenmez; kullanıcı omp'yi güncellemeni istediğinde `skill/omp-guncelle/SKILL.md` dosyasını oku ve uygula.
+
+**Asla:** `omp update`, @oh-my-pi paketleri için `bun install -g` / `bun update -g`, `npm i -g` ya da omp'nin resmî kurulum betiği (hepsi yamasız omp kurar); `~/.local/share/omp-yamalari` altında elle dosya düzenleme; yama çakışmasını elle çözme.
 
 ## Kurulum
 
