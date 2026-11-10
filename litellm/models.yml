@@ -69,14 +69,6 @@ providers:
         reasoning: true
         thinking: {mode: effort, efforts: [low, medium, high, max], defaultLevel: high}
         compat: {supportsReasoningEffort: true}
-      gemini-3.6-flash:
-        reasoning: true
-        thinking: {mode: effort, efforts: [minimal, low, medium, high], defaultLevel: high}
-        compat: {supportsReasoningEffort: true}
-      gemini-3.7-flash:
-        reasoning: true
-        thinking: {mode: effort, efforts: [low, medium, high], defaultLevel: high}
-        compat: {supportsReasoningEffort: true}
       gemini-3.8-flash:
         reasoning: true
         thinking: {mode: effort, efforts: [low, medium, high], defaultLevel: high}
