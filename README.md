@@ -6,6 +6,7 @@
 >
 > **AI agent'san:** [şu bölümdeki](#ai-agentsan) adımları sırayla uygula.
 
+- **Yalnız omp'de doğrudan Cursor kullananlar için.** Yamaların hepsi omp'nin Cursor sağlayıcısında (`cursor/...` modelleri) devreye girer. omp'yi LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsan bunlara ihtiyacın yok: düz omp soru sormayı, arka plan işlerini ve alt ajanları zaten kendisi yapar, `omp update` yeter.
 - omp git kaynağından çalışır; yamalar upstream'in üstüne uygulanır.
 - Güncelleme önce upstream'in en yeni kararlı sürümünü (`vX.Y.Z` etiketi) yamalarla birleştirmeyi dener. Çakışma, native (Rust) farkı ya da test hatası olursa yayınlayanın test ettiği sürüme kalır. Yamalar kısmen uygulanmaz, doğrulanmamış sürüme geçilmez.
 - Her sürüm kendi dizininde hazırlanır ve test edilir; canlı sürüm tek bir symlink değişimiyle değişir. Açık omp oturumları eski sürümle çalışmaya devam eder, geri alma anlıktır.
@@ -13,7 +14,7 @@
 
 ## Kullanıcıysan
 
-Aşağıdaki metni kopyala ve omp'ye (ya da kullandığın başka bir AI agent'a) yapıştır:
+omp'yi yalnız LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsan buna gerek yok; düz omp yeter. omp'de doğrudan Cursor kullanıyorsan aşağıdaki metni kopyala ve omp'ye (ya da kullandığın başka bir AI agent'a) yapıştır:
 
 ```text
 omp'yi KadirBerkpolat1'in yamalarıyla kurmanı istiyorum.
@@ -27,7 +28,9 @@ Kurulum birkaç dakika sürer; agent bitti diyene kadar omp'yi kapatma. Bitince 
 
 Kullanıcın omp'yi bu yamalarla kurmanı istediyse bu adımları sırayla uygula ve kullanıcıyla Türkçe konuş. Komutları kullanıcının hesabıyla çalıştır; `sudo` gerekirse kendin çalıştırma, komutu kullanıcıya ver.
 
-0. **Kurulum zaten var mı?** `~/.local/share/omp-yamalari/canli` varsa kurulum yapılmıştır: kurma; güncelleme, sürüm sorusu ve geri alma için `~/.local/share/omp-yamalari/repo/skill/omp-guncelle/SKILL.md` dosyasını oku ve uygula. Depo henüz yoksa klonla (zaten varsa `git clone` hata verir; sorun değil, devam et):
+0. **Yamalar işe yarar mı?** Yamalar yalnız omp'nin Cursor sağlayıcısında (`cursor/...` modelleri) devreye girer. Kullanıcı omp'yi LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsa (kendi modelinin sağlayıcısına bak; emin değilsen sor), kurmadan önce ona şunu söyle: "Bu yamalar yalnız doğrudan Cursor bağlantısında işe yarıyor; senin kurulumunda düz omp ile aynı davranacak. Yine de kurayım mı?" Kullanıcı isterse devam et.
+
+   **Kurulum zaten var mı?** `~/.local/share/omp-yamalari/canli` varsa kurulum yapılmıştır: kurma; güncelleme, sürüm sorusu ve geri alma için `~/.local/share/omp-yamalari/repo/skill/omp-guncelle/SKILL.md` dosyasını oku ve uygula. Depo henüz yoksa klonla (zaten varsa `git clone` hata verir; sorun değil, devam et):
    ```sh
    git clone https://github.com/KadirBerkpolat1/omp-yamalari ~/.local/share/omp-yamalari/repo
    ```
