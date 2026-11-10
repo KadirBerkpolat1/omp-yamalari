@@ -1,0 +1,1050 @@
+#!/usr/bin/env bash
+# omp-yama: KadirBerkpolat1'in omp yamalarını upstream'in en yeni kararlı sürümüyle birlikte kurar
+# ve güncel tutar (arkadaşın makinesi). Yayın sözleşmesi ortak.sh'ta, akış README.md'de.
+# Canlı sürüme yerinde dokunulmaz: her sürüm surumler/ altında hazırlanıp doğrulanır, sonra
+# canli bağlantısı tek bir rename ile çevrilir.
+set -Eeuo pipefail
+shopt -s inherit_errexit nullglob
+
+BETIK=$(readlink -f "${BASH_SOURCE[0]}")
+# shellcheck source=ortak.sh
+source "${BETIK%/*}/ortak.sh"
+
+ROOT=$(realpath -ms "${OMP_YAMA_KOK:-$HOME/.local/share/omp-yamalari}")
+REPO=$ROOT/repo
+KAYNAK=$ROOT/kaynak.git
+GECICI=$ROOT/gecici
+BILGI=.omp-yama-bilgi
+SKILL_YOLU=${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/skills/omp-guncelle
+BUN_EN_AZ=1.4.4
+GIT_EN_AZ=2.38
+GEREKEN_ALAN_KB=$((3 * 1024 * 1024))
+export GIT_TERMINAL_PROMPT=0
+# Çağıranın ortamından gelen bir GIT_DIR, reset --hard'ı başka bir depoya yöneltmesin.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE
+
+KOMUT='' GUNLUK=- SONUC=basarisiz KIP=- ESKI=- YENI=- UPSTREAM=- NEDEN=- Y_NEDEN=''
+ZORLA=0 TEST_EDILMIS=0 BASLANGIC=$SECONDS
+declare -A YAYIN=() Y_ADAY=() M_ADAY=()
+TEST_DOSYALARI=() YAMA_PAKETLERI=() TEST_ORTAMI=()
+
+kullanim() {
+	cat >&2 <<'EOF'
+Kullanım: omp-yama <komut>
+
+  kur [--zorla]              yamalı omp'yi ilk kez kurar; omp komutunu ve omp-guncelle skill'ini bağlar
+  guncelle [--test-edilmis]  upstream'in en yeni kararlı sürümü + yamaları dener, olmazsa
+                             yayınlayanın test ettiği sürüme geçer (--test-edilmis: doğrudan ona)
+  kontrol                    canlı sürümü, son yayını ve upstream'i karşılaştırır; hiçbir şeyi değiştirmez
+  geri-al                    bir önceki sürüme döner
+  kaldir                     eski omp'yi ve skill'i geri koyar, kurulumu siler
+
+Tam yol: ~/.local/share/omp-yamalari/repo/omp-yama
+EOF
+	exit "${1:-2}"
+}
+
+# ---------------------------------------------------------------- çıktı, günlük, kilit
+
+# bilgi <metin>: kısa ilerleme satırı; terminale ve günlüğe.
+bilgi() {
+	printf '%s\n' "$*" >&3
+	printf '[%(%H:%M:%S)T] %s\n' -1 "$*" >&2
+}
+
+# cikti <ANAHTAR=değer>...: makinenin okuyacağı satırlar; terminale ve günlüğe.
+cikti() {
+	printf '%s\n' "$@" >&3
+	printf '%s\n' "$@" >&2
+}
+
+uyari() { cikti "UYARI=$*"; }
+
+# calistir <komut...>: dış komutu günlüğe yazarak çalıştırır. Terminal (3, 4) ve kilit (9)
+# tanıtıcıları devredilmez: arkada kalan bir süreç çağıranın borusunu ya da kilidi tutmasın.
+calistir() {
+	printf '+ %s\n' "$*" >&2
+	"$@" 3>&- 4>&- 9>&-
+}
+
+kilit_al() {
+	if [[ -n ${OMP_YAMA_YENIDEN:-} ]] && { : >&9; } 2>/dev/null && flock -n 9; then
+		return 0
+	fi
+	exec 9>>"$ROOT/kilit"
+	if ! flock -n 9; then
+		printf 'omp-yama: başka bir omp-yama işlemi sürüyor (kilit: %s); bitmesini bekleyip yeniden dene.\n' "$ROOT/kilit" >&2
+		exit 3
+	fi
+}
+
+baslat() {
+	KOMUT=$1
+	mkdir -p "$ROOT"
+	kilit_al
+	local dizin=$ROOT/gunluk
+	# kaldir kurulumu (günlük dizini dahil) siler; onun günlüğü kurulumun dışında kalır.
+	if [[ $KOMUT == kaldir ]]; then dizin=${TMPDIR:-/tmp}; fi
+	if [[ -n ${OMP_YAMA_GUNLUK:-} ]]; then
+		GUNLUK=$OMP_YAMA_GUNLUK
+	else
+		mkdir -p "$dizin"
+		GUNLUK=$dizin/$(date +%Y%m%d-%H%M%S)-$KOMUT.log
+		if [[ $KOMUT == kaldir ]]; then GUNLUK=$dizin/omp-yama-${GUNLUK##*/}; fi
+		if [[ -e $GUNLUK ]]; then GUNLUK=${GUNLUK%.log}-$$.log; fi
+	fi
+	exec 3>&1 4>&2 >>"$GUNLUK" 2>&1
+	trap 'hata_yakala "$?" "$LINENO" "$BASH_COMMAND"' ERR
+	trap cikis_tuzagi EXIT
+	trap 'KESILDI=1; exit 130' INT
+	trap 'KESILDI=1; exit 143' TERM
+	printf '=== %s omp-yama %s\n' "$(date -u +%FT%TZ)" "${ARGS[*]}" >&2
+	printf 'betik=%s ROOT=%s HOME=%s\nPATH=%s\n' "$BETIK" "$ROOT" "$HOME" "$PATH" >&2
+	if [[ $KOMUT != kaldir ]]; then gunlukleri_buda; fi
+}
+
+gunlukleri_buda() {
+	local gunlukler=("$ROOT"/gunluk/*.log)
+	if ((${#gunlukler[@]} > 20)); then
+		rm -f -- "${gunlukler[@]:0:${#gunlukler[@]}-20}"
+	fi
+}
+
+hata_yakala() {
+	HATA_KODU=$1 HATA_SATIRI=$2 HATA_KOMUTU=$3
+	printf '!!! hata (satır %s, çıkış %s): %s\n' "$2" "$1" "$3" >&2
+}
+
+cikis_tuzagi() {
+	local kod=$? neden
+	trap - ERR
+	rm -rf "$GECICI" "$ROOT/.canli.tmp" "$ROOT/.onceki.tmp"
+	if ((kod != 0)) && [[ -z ${SONUC_YAZILDI:-} ]]; then
+		if [[ -n ${KESILDI:-} ]]; then
+			neden="işlem kesildi; canlı sürüme dokunulmadı"
+		else
+			neden="beklenmeyen hata: ${HATA_KOMUTU:-?} (satır ${HATA_SATIRI:-?}, çıkış ${HATA_KODU:-$kod})"
+		fi
+		bilgi "HATA: $neden"
+		if [[ $KOMUT == kur || $KOMUT == guncelle ]]; then
+			NEDEN=$neden SONUC=basarisiz YENI=-
+			sonuc_yaz
+			kod=1
+		else
+			cikti "SONUC=basarisiz" "NEDEN=$neden" "GUNLUK=$GUNLUK"
+		fi
+	fi
+	exit "$kod"
+}
+
+sonuc_yaz() {
+	SONUC_YAZILDI=1
+	bilgi "süre: $((SECONDS - BASLANGIC)) sn"
+	cikti "SONUC=$SONUC" "KIP=$KIP" "ESKI=$ESKI" "YENI=$YENI" "UPSTREAM=$UPSTREAM" "NEDEN=$NEDEN" "GUNLUK=$GUNLUK"
+}
+
+# basarisiz <neden>: komutu başarısız bitirir; canlı sürüme dokunulmamıştır.
+basarisiz() {
+	bilgi "HATA: $1"
+	if [[ $KOMUT == kur || $KOMUT == guncelle ]]; then
+		NEDEN=$1 SONUC=basarisiz YENI=-
+		sonuc_yaz
+	else
+		SONUC_YAZILDI=1
+		cikti "SONUC=basarisiz" "NEDEN=$1" "GUNLUK=$GUNLUK"
+	fi
+	exit 1
+}
+
+# surum_ozeti <sürüm dizini ya da bağlantısı>: "<sürüm> <commit12> <kip>" ya da "-".
+surum_ozeti() {
+	local b=$1/$BILGI c
+	if [[ ! -f $b ]]; then
+		echo -
+		return
+	fi
+	c=$(manifest_oku "$b" COMMIT)
+	printf '%s %s %s\n' "$(manifest_oku "$b" SURUM)" "${c:0:12}" "$(manifest_oku "$b" KIP)"
+}
+
+# ---------------------------------------------------------------- ön koşullar
+
+on_kosullar() {
+	[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] ||
+		basarisiz "yalnız Linux x86_64 destekleniyor (bu sistem: $(uname -sm))"
+	local eksik=() arac git_surum
+	for arac in git curl zstd tar flock sha256sum getconf; do
+		command -v "$arac" >/dev/null || eksik+=("$arac")
+	done
+	((${#eksik[@]} == 0)) ||
+		basarisiz "eksik araçlar: ${eksik[*]} (Arch/CachyOS: sudo pacman -S --needed git curl zstd tar util-linux coreutils glibc)"
+	git_surum=$(git --version | awk '{ print $3 }')
+	surum_en_az "$git_surum" "$GIT_EN_AZ" ||
+		basarisiz "git $git_surum çok eski, en az $GIT_EN_AZ gerekli (sudo pacman -Syu git)"
+	bun_hazirla
+	alan_denetle || basarisiz "$ALAN_HATASI"
+}
+
+bun_surumu() { "$1" --version 2>/dev/null || echo 0; }
+
+# bun_hazirla: BUN'u (mutlak yol) ve BUN_SURUM'u ayarlar; bun yoksa ~/.bun'a kurar, ~/.bun'daki eskiyse yükseltir.
+bun_hazirla() {
+	local bun ev_bun=$HOME/.bun/bin/bun surum
+	bun=$(command -v bun || true)
+	[[ $bun == /* ]] || bun=
+	if [[ -z $bun && -x $ev_bun ]]; then bun=$ev_bun; fi
+	if [[ -z $bun ]]; then
+		bilgi "bun bulunamadı; resmî kurulum betiğiyle ~/.bun içine kuruluyor"
+		calistir env BUN_INSTALL="$HOME/.bun" bash -c 'set -o pipefail; curl -fsSL https://bun.sh/install | bash' ||
+			basarisiz "bun kurulamadı (unzip kurulu mu? sudo pacman -S --needed unzip); elle kurmak için: curl -fsSL https://bun.sh/install | bash"
+		bun=$ev_bun
+	fi
+	surum=$(bun_surumu "$bun")
+	if ! surum_en_az "$surum" "$BUN_EN_AZ" && [[ $bun -ef $ev_bun ]]; then
+		bilgi "bun $surum eski; bun upgrade çalıştırılıyor"
+		calistir "$bun" upgrade || true
+		surum=$(bun_surumu "$bun")
+	fi
+	surum_en_az "$surum" "$BUN_EN_AZ" ||
+		basarisiz "bun $surum ($bun) çok eski, en az $BUN_EN_AZ gerekli; onu kuran paket yöneticisiyle güncelle (ör. sudo pacman -Syu) ya da ~/.bun'a kur: curl -fsSL https://bun.sh/install | bash"
+	BUN=$bun BUN_SURUM=$surum
+}
+
+alan_denetle() {
+	local kb
+	kb=$(df -Pk "$ROOT" | awk 'NR == 2 { print $4 }')
+	if [[ $kb =~ ^[0-9]+$ ]] && ((kb < GEREKEN_ALAN_KB)); then
+		ALAN_HATASI="yetersiz disk alanı: $ROOT için $((kb / 1024)) MB boş, en az 3 GB gerekli"
+		return 1
+	fi
+}
+
+# baska_kaynak_denetle: PATH'teki omp başka bir git checkout'unun cli.ts'ini çalıştıran bir betikse
+# (yayınlayanın kendi makinesi böyledir) --zorla olmadan kurmayı reddeder.
+baska_kaynak_denetle() {
+	local p
+	p=$(command -v omp || true)
+	[[ $p == /* && -f $p ]] || return 0
+	if bizim_mi "$p" || [[ $(head -c 2 "$p") != '#!' ]] || grep -q '^# omp-yamalari$' "$p" ||
+		! grep -q 'packages/coding-agent/src/cli\.ts' "$p"; then
+		return 0
+	fi
+	if ((ZORLA)); then
+		bilgi "UYARI: $p başka bir omp kaynağını çalıştırıyor; --zorla verildiği için yerine geçiliyor"
+		return 0
+	fi
+	basarisiz "omp zaten başka bir git kaynağından çalışıyor ($p); burası yamaların kaynağı olabilir. Yine de kurmak için: omp-yama kur --zorla"
+}
+
+# ---------------------------------------------------------------- depolar ve yayın
+
+# repo_hazirla: ROOT/repo'yu (yönetilen ayna) yoksa klonlar, origin/main'e eşitler. omp-yama değiştiyse
+# ya da bu betik ROOT/repo'daki değilse bir kez yenisiyle yeniden başlar (kilit ve günlük devredilir).
+repo_hazirla() {
+	local url=${OMP_YAMALARI_URL:-https://github.com/$OMP_YAMALARI_GH.git} once sonra
+	if [[ ! -d $REPO/.git ]]; then
+		bilgi "omp-yamalari deposu klonlanıyor: $url"
+		rm -rf "$REPO" "$REPO.tmp"
+		calistir git clone --quiet "$url" "$REPO.tmp" || basarisiz "omp-yamalari deposu klonlanamadı: $url"
+		mv -T "$REPO.tmp" "$REPO"
+	fi
+	once=$(git -C "$REPO" rev-parse -q --verify HEAD || true)
+	bilgi "omp-yamalari deposu güncelleniyor"
+	calistir git -C "$REPO" fetch --quiet --prune origin ||
+		basarisiz "omp-yamalari deposu çekilemedi; ağ bağlantısını denetle"
+	calistir git -C "$REPO" reset --quiet --hard origin/main ||
+		basarisiz "omp-yamalari deposu origin/main'e eşitlenemedi"
+	sonra=$(git -C "$REPO" rev-parse HEAD)
+	[[ -f $REPO/omp-yama && -f $REPO/ortak.sh ]] || basarisiz "yayın bozuk: depoda omp-yama ya da ortak.sh yok"
+	if [[ -z ${OMP_YAMA_YENIDEN:-} ]] && [[ $once != "$sonra" || $BETIK != "$(readlink -f "$REPO/omp-yama")" ]]; then
+		bilgi "omp-yama'nın depodaki sürümüyle yeniden başlatılıyor"
+		exec env OMP_YAMA_YENIDEN=1 OMP_YAMA_GUNLUK="$GUNLUK" bash "$REPO/omp-yama" "${ARGS[@]}" >&3 2>&4 3>&- 4>&-
+	fi
+}
+
+kaynak_hazirla() {
+	local url=${OMP_UPSTREAM_URL:-$OMP_UPSTREAM_URL_VARSAYILAN}
+	if [[ ! -f $KAYNAK/HEAD ]]; then
+		bilgi "upstream klonlanıyor (yalnız commit ve ağaçlar, birkaç dakika sürebilir): $url"
+		rm -rf "$KAYNAK" "$KAYNAK.tmp"
+		calistir git clone --quiet --bare --filter=blob:none --single-branch --branch main --no-tags "$url" "$KAYNAK.tmp" ||
+			basarisiz "upstream klonlanamadı: $url"
+		git --git-dir="$KAYNAK.tmp" config remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+		git --git-dir="$KAYNAK.tmp" config remote.origin.tagOpt --no-tags
+		mv -T "$KAYNAK.tmp" "$KAYNAK"
+	fi
+	UPSTREAM_URL=$(git --git-dir="$KAYNAK" config remote.origin.url)
+	bilgi "upstream güncelleniyor"
+	calistir git --git-dir="$KAYNAK" fetch --quiet origin || basarisiz "upstream çekilemedi: $UPSTREAM_URL"
+}
+
+# yayin_alani <dosya> <ANAHTAR> <desen>: alanı okuyup biçimini denetler, YAYIN'a koyar.
+yayin_alani() {
+	local deger
+	deger=$(manifest_oku "$1" "$2")
+	[[ $deger =~ $3 ]] || basarisiz "yayın bozuk: yama.env'de $2 eksik ya da geçersiz ('$deger')"
+	YAYIN[$2]=$deger
+}
+
+yayin_yukle() {
+	local m=$REPO/yama.env h40='^[0-9a-f]{40}$' h64='^[0-9a-f]{64}$'
+	[[ -f $m && -f $REPO/yamalar.patch ]] || basarisiz "yayın bozuk: depoda yama.env ya da yamalar.patch yok"
+	YAYIN=()
+	yayin_alani "$m" YAYIN_ZAMANI '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+	yayin_alani "$m" SURUM '^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$'
+	yayin_alani "$m" TABAN "$h40"
+	yayin_alani "$m" AGAC "$h40"
+	yayin_alani "$m" NATIVE_ANAHTAR "$h64"
+	yayin_alani "$m" NATIVE_KAYNAK '^(release|npm)$'
+	if [[ ${YAYIN[NATIVE_KAYNAK]} == release ]]; then
+		yayin_alani "$m" NATIVE_URL '^https://[^[:space:]]+$'
+		yayin_alani "$m" NATIVE_SHA256 "$h64"
+		yayin_alani "$m" NATIVE_GLIBC '^[0-9]+(\.[0-9]+)+$'
+	else
+		yayin_alani "$m" NATIVE_NPM_SURUM '^[0-9]+\.[0-9]+\.[0-9]+$'
+		yayin_alani "$m" NATIVE_NPM_INTEGRITY '^sha512-[A-Za-z0-9+/]+={0,2}$'
+	fi
+}
+
+# yama_listeleri: yamalar.patch'in dokunduğu test dosyaları ve paketler.
+yama_listeleri() {
+	local yollar
+	yollar=$(sed -n 's#^diff --git a/\([^ ]*\) b/\([^ ]*\)$#\1\n\2#p' "$REPO/yamalar.patch" | sort -u)
+	mapfile -t TEST_DOSYALARI < <(grep -E '^packages/[^/]+/test/.+\.test\.ts$' <<<"$yollar" || true)
+	mapfile -t YAMA_PAKETLERI < <(sed -n 's#^packages/\([^/]*\)/.*#\1#p' <<<"$yollar" | sort -u)
+}
+
+# test_ortami_hazirla: upstream CI'ın test ortamı (scripts/ci-test-ts.ts); kimlik bilgileri ve
+# çağıran omp oturumunun PI_*/OMP_* değişkenleri testlere geçmez.
+test_ortami_hazirla() {
+	local ad
+	TEST_ORTAMI=(env)
+	while IFS= read -r ad; do
+		case $ad in
+		PI_NATIVE_VARIANT) ;;
+		PI_* | OMP_* | AWS_* | GOOGLE_CLOUD_* | GITHUB_TOKEN | GH_TOKEN | COPILOT_GITHUB_TOKEN | \
+			GOOGLE_APPLICATION_CREDENTIALS | *_API_KEY | *_OAUTH_TOKEN | *BEARER_TOKEN*)
+			TEST_ORTAMI+=(-u "$ad")
+			;;
+		esac
+	done < <(compgen -e)
+	TEST_ORTAMI+=(GITHUB_ACTIONS= PI_TEST_RUNTIME=1 BUN_JSC_useConcurrentGC=0 BUN_JSC_numberOfGCMarkers=1)
+}
+
+commit_var_mi() { GIT_NO_LAZY_FETCH=1 git --git-dir="$KAYNAK" cat-file -e "$1^{commit}" 2>/dev/null; }
+
+# paket_bilgisi <commit>: "<packages/utils sürümü> <istenen en düşük bun sürümü ya da ->".
+# shellcheck disable=SC2016
+paket_bilgisi() {
+	git --git-dir="$KAYNAK" show "$1:packages/utils/package.json" |
+		"$BUN" -e 'const j = await Bun.stdin.json();
+			console.log(`${j.version} ${String(j.engines?.bun ?? "").replace(/[^0-9.]/g, "") || "-"}`);'
+}
+
+# y_hesapla: test edilmiş commit Y'yi (TABAN + yamalar.patch, sabit kimlik ve tarih) kurar.
+y_hesapla() {
+	local taban=${YAYIN[TABAN]} agac y anahtar
+	bilgi "test edilmiş sürüm: ${YAYIN[SURUM]} (yayın ${YAYIN[YAYIN_ZAMANI]}, taban ${taban:0:12})"
+	if ! commit_var_mi "$taban"; then
+		calistir git --git-dir="$KAYNAK" fetch --quiet origin "$taban" || true
+		commit_var_mi "$taban" || basarisiz "yayının TABAN commit'i upstream'de bulunamadı: $taban"
+	fi
+	agac=$(yama_agaci "$KAYNAK" "$taban" "$REPO/yamalar.patch") ||
+		basarisiz "yayın bozuk: yamalar.patch TABAN'a uygulanamadı"
+	[[ $agac == "${YAYIN[AGAC]}" ]] ||
+		basarisiz "yayın bozuk: yamalar.patch'in ağacı ($agac) yama.env'deki AGAC ile aynı değil"
+	y=$(sabit_commit "$KAYNAK" "${YAYIN[YAYIN_ZAMANI]}" "$agac" "omp-yamalari ${YAYIN[SURUM]} (${YAYIN[YAYIN_ZAMANI]})" "$taban")
+	anahtar=$(native_anahtar "$KAYNAK" "$y")
+	[[ $anahtar == "${YAYIN[NATIVE_ANAHTAR]}" ]] ||
+		basarisiz "yayın bozuk: test edilmiş ağacın native anahtarı ($anahtar) yama.env'deki NATIVE_ANAHTAR ile aynı değil"
+	Y_ADAY=([commit]=$y [kip]=test-edilmis [upstream]=taban:${taban:0:12} [tip_denetimi]=0)
+	if [[ ${YAYIN[NATIVE_KAYNAK]} == release ]]; then
+		Y_ADAY+=([native_tur]=release [native_id]=rel-${anahtar:0:12} [native_sha256]=${YAYIN[NATIVE_SHA256]}
+			[native_url]=${OMP_YAMA_NATIVE_URL:-${YAYIN[NATIVE_URL]}} [native_glibc]=${YAYIN[NATIVE_GLIBC]})
+	else
+		Y_ADAY+=([native_tur]=npm [native_id]=npm-${YAYIN[NATIVE_NPM_SURUM]} [npm_surum]=${YAYIN[NATIVE_NPM_SURUM]}
+			[npm_integrity]=${YAYIN[NATIVE_NPM_INTEGRITY]})
+	fi
+}
+
+# reddedilen: "<commit> <neden>" satırları. Doğrulamada adaydan kaynaklanan bir hatayla kalan ya da geri
+# alınan sürüm kendiliğinden yeniden kurulmaz.
+red_nedeni() {   # <commit>: listedeki son nedeni basar (yoksa boş)
+	if [[ -f $ROOT/reddedilen ]]; then sed -n "s/^$1 //p" "$ROOT/reddedilen" | tail -n 1; fi
+}
+
+red_ekle() {   # <commit> <neden>: commit listede yoksa ekler
+	[[ -n $(red_nedeni "$1") ]] || printf '%s %s\n' "$1" "$2" >>"$ROOT/reddedilen"
+}
+
+red_sil() {   # <commit>: commit'in satırlarını listeden çıkarır
+	local f=$ROOT/reddedilen kod=0
+	[[ -f $f ]] || return 0
+	mkdir -p "$GECICI" || return 1
+	grep -v "^$1 " "$f" >"$GECICI/reddedilen" || kod=$?
+	((kod <= 1)) && mv -f "$GECICI/reddedilen" "$f"
+}
+
+# m_hesapla: upstream'in en yeni kararlı etiketi T için aday M = Y ile T'nin birleşmesi. Aday yoksa
+# M_ADAY boş kalır, NEDEN nedenini söyler.
+m_hesapla() {
+	local taban=${YAYIN[TABAN]} etiket tc cikti durum=0 agac tarih m red anahtar_m anahtar_t npm
+	M_ADAY=()
+	etiket=$(kararli_etiketler "$UPSTREAM_URL" | tail -n 1) || etiket=
+	if [[ -z $etiket ]]; then
+		NEDEN="etiket-yok: upstream'in kararlı sürüm etiketleri okunamadı"
+		return 0
+	fi
+	if ! calistir git --git-dir="$KAYNAK" fetch --quiet --no-tags origin "+refs/tags/$etiket:refs/tags/$etiket" ||
+		! tc=$(git --git-dir="$KAYNAK" rev-parse --verify -q "$etiket^{commit}"); then
+		NEDEN="etiket-yok: $etiket upstream'den çekilemedi"
+		return 0
+	fi
+	if git --git-dir="$KAYNAK" merge-base --is-ancestor "$tc" "$taban"; then
+		bilgi "en yeni upstream sürümü $etiket zaten test edilmiş sürümün içinde"
+		NEDEN="$etiket zaten test edilmiş sürümün tabanında"
+		return 0
+	fi
+	if ! git --git-dir="$KAYNAK" merge-base --is-ancestor "$taban" "$tc"; then
+		NEDEN="ayrik: $etiket test edilmiş sürümün tabanından türemiyor"
+		return 0
+	fi
+	bilgi "en yeni upstream sürümü $etiket yamalarla birleştiriliyor"
+	cikti=$(git --git-dir="$KAYNAK" merge-tree --write-tree --name-only --no-messages "${Y_ADAY[commit]}" "$tc") || durum=$?
+	if ((durum == 1)); then
+		NEDEN="cakisma: yamalar $etiket ile çakışıyor ($(sed '1d;/^$/d' <<<"$cikti" | sort -u | paste -sd ' ' -))"
+		return 0
+	elif ((durum != 0)); then
+		NEDEN="cakisma: $etiket ile birleştirme denenemedi (git merge-tree çıkış kodu $durum)"
+		return 0
+	fi
+	agac=$(head -n 1 <<<"$cikti")
+	tarih=$(git --git-dir="$KAYNAK" log -1 --format=%cI "$tc")
+	m=$(sabit_commit "$KAYNAK" "$tarih" "$agac" "omp-yamalari ${YAYIN[SURUM]} yamaları + $etiket" "${Y_ADAY[commit]}" "$tc")
+	red=$(red_nedeni "$m")
+	if [[ -n $red && $m != "$CANLI_COMMIT" ]]; then
+		case $red in
+		geri-alindi:*) NEDEN="$red ($etiket + yamalar daha önce geri alındı)" ;;
+		*) NEDEN="$red (daha önce reddedildi)" ;;
+		esac
+		return 0
+	fi
+	if ! anahtar_m=$(native_anahtar "$KAYNAK" "$m") || ! anahtar_t=$(native_anahtar "$KAYNAK" "$tc") ||
+		[[ $anahtar_m != "$anahtar_t" ]]; then
+		NEDEN="native-farki: yamalarla birleşmenin native (Rust) girdileri $etiket ile aynı değil"
+		return 0
+	fi
+	if ! npm=$(npm_native_bilgi "${etiket#v}") || [[ $npm != *' sha512-'* ]]; then
+		NEDEN="npm-yok: npm'de $NPM_NATIVE_PAKETI@${etiket#v} bulunamadı"
+		return 0
+	fi
+	M_ADAY=([commit]=$m [kip]=en-yeni [upstream]=$etiket [tip_denetimi]=1 [native_tur]=npm
+		[native_id]=npm-${etiket#v} [npm_surum]=${etiket#v} [npm_tarball]=${npm% *} [npm_integrity]=${npm#* })
+}
+
+# ---------------------------------------------------------------- sürüm hazırlama
+# Bu bölümdeki işlevler `if` içinde çağrılır (set -e orada işlemez): her adım kendi hatasını
+# HAZIRLIK_HATASI'na yazar; KALICI=0 ortamdan kaynaklanan (ağ, disk) hatalardır, aday reddedilmez.
+
+surum_dizinini_sil() {
+	[[ -e $1 ]] || return 0
+	rm -rf "$1"
+	calistir git --git-dir="$KAYNAK" worktree prune || true
+}
+
+agac_butunlugu() {   # <dizin> <commit>
+	local deneme durum=
+	for deneme in 1 2; do
+		if [[ $(git -C "$1" rev-parse HEAD 2>/dev/null) == "$2" ]] &&
+			durum=$(git -C "$1" status --porcelain --untracked-files=no) && [[ -z $durum ]]; then
+			return 0
+		fi
+		printf 'çalışma ağacı eksik ya da farklı (deneme %s):\n%s\n' "$deneme" "${durum:0:4000}" >&2
+		((deneme == 2)) || calistir git -C "$1" -c core.hooksPath=/dev/null checkout --quiet -f HEAD -- . || true
+	done
+	return 1
+}
+
+# bun_kur <dizin>: yalnız bun.lock'un package.json'la uyuşmaması adayın hatasıdır; başka bir hata
+# (ağ, npm kayıt defteri) ortamındır, aday reddedilmez.
+bun_kur() {
+	local deneme cikti=$GECICI/bun-install.log
+	for deneme in 1 2; do
+		if mkdir -p "$GECICI" && (cd "$1" && calistir "$BUN" install --frozen-lockfile) >"$cikti" 2>&1; then
+			cat "$cikti" >&2
+			return 0
+		fi
+		cat "$cikti" >&2
+		if grep -q 'lockfile had changes, but lockfile is frozen' "$cikti"; then
+			HAZIRLIK_HATASI="bun install --frozen-lockfile: bun.lock package.json ile uyuşmuyor" KALICI=1
+			return 1
+		fi
+		((deneme == 2)) || bilgi "  bun install yeniden deneniyor"
+	done
+	HAZIRLIK_HATASI="bun install --frozen-lockfile başarısız (ağ bağlantısını denetle)" KALICI=0
+	return 1
+}
+
+# native_getir <aday adı> <dosya adı>: doğrulanmış native'i ROOT/native/<id>/ önbelleğine getirir,
+# yolunu NATIVE_DOSYASI'na yazar.
+native_getir() {
+	local -n n=$1
+	local dosya=$2 dizin=$ROOT/native/${n[native_id]} gecici npm tarball
+	NATIVE_DOSYASI=$dizin/$dosya
+	if [[ -f $NATIVE_DOSYASI && -f $NATIVE_DOSYASI.sha256 ]] &&
+		(cd "$dizin" && sha256sum --check --status "$dosya.sha256") &&
+		[[ ${n[native_tur]} != release || $(cut -d ' ' -f 1 "$NATIVE_DOSYASI.sha256") == "${n[native_sha256]}" ]]; then
+		bilgi "  native önbellekten: ${n[native_id]}"
+		return 0
+	fi
+	KALICI=0
+	if ! mkdir -p "$GECICI" || ! gecici=$(mktemp -d "$GECICI/native.XXXXXX"); then
+		HAZIRLIK_HATASI="geçici dizin oluşturulamadı: $GECICI"
+		return 1
+	fi
+	if [[ ${n[native_tur]} == release ]]; then
+		bilgi "  native indiriliyor: ${n[native_url]}"
+		if ! calistir curl -fsSL --retry 2 -o "$gecici/native.zst" "${n[native_url]}"; then
+			HAZIRLIK_HATASI="native indirilemedi: ${n[native_url]}"
+			return 1
+		fi
+		if ! calistir zstd -q -d --long=27 -o "$gecici/$dosya" "$gecici/native.zst"; then
+			HAZIRLIK_HATASI="indirilen native açılamadı (zstd)"
+			return 1
+		fi
+		if [[ $(sha256sum "$gecici/$dosya" | cut -d ' ' -f 1) != "${n[native_sha256]}" ]]; then
+			HAZIRLIK_HATASI="indirilen native'in sha256'sı yama.env'deki NATIVE_SHA256 ile aynı değil"
+			return 1
+		fi
+	else
+		tarball=${n[npm_tarball]:-}
+		if [[ -z $tarball ]]; then
+			if ! npm=$(npm_native_bilgi "${n[npm_surum]}"); then
+				HAZIRLIK_HATASI="npm'den $NPM_NATIVE_PAKETI@${n[npm_surum]} bilgisi alınamadı"
+				return 1
+			fi
+			tarball=${npm% *}
+			if [[ ${npm#* } != "${n[npm_integrity]}" ]]; then
+				HAZIRLIK_HATASI="npm'deki $NPM_NATIVE_PAKETI@${n[npm_surum]} integrity'si yama.env'dekiyle aynı değil"
+				return 1
+			fi
+		fi
+		bilgi "  native indiriliyor: $NPM_NATIVE_PAKETI@${n[npm_surum]}"
+		if ! calistir curl -fsSL --retry 2 -o "$gecici/paket.tgz" "$tarball"; then
+			HAZIRLIK_HATASI="native indirilemedi: $tarball"
+			return 1
+		fi
+		if ! sri_dogrula "$gecici/paket.tgz" "${n[npm_integrity]}"; then
+			HAZIRLIK_HATASI="indirilen npm paketinin integrity'si tutmuyor"
+			return 1
+		fi
+		if ! calistir tar -xzf "$gecici/paket.tgz" -C "$gecici" "package/$dosya" ||
+			! mv "$gecici/package/$dosya" "$gecici/$dosya"; then
+			HAZIRLIK_HATASI="npm paketinde package/$dosya yok"
+			KALICI=1
+			return 1
+		fi
+	fi
+	if ! (cd "$gecici" && sha256sum "$dosya" >"$dosya.sha256") || ! mkdir -p "$dizin" ||
+		! mv -f "$gecici/$dosya" "$NATIVE_DOSYASI" || ! mv -f "$gecici/$dosya.sha256" "$NATIVE_DOSYASI.sha256"; then
+		HAZIRLIK_HATASI="native önbelleğe yazılamadı: $dizin"
+		return 1
+	fi
+	rm -rf "$gecici"
+	KALICI=1
+}
+
+# native_kur <sürüm dizini> <önbellek dosyası> <dosya adı>: kopyayı o dizinin sürümüyle damgalar,
+# sonra yerine taşır (yerinde damgalanan dosya, onu eşlemiş bir süreci bozabilir).
+native_kur() {
+	local hedef=$1/packages/natives/native/$3
+	local gecici=$1/packages/natives/native/.$3.omp-yama
+	cp --reflink=auto "$2" "$gecici" &&
+		calistir "$BUN" "$1/scripts/stamp-native-version.ts" "$gecici" &&
+		mv -f "$gecici" "$hedef"
+}
+
+# native_dogrula <sürüm dizini> <dosya adı>: native gerçekten bu dizinden yükleniyor ve sürüm damgası
+# tutuyor mu (dosya yoksa ya da yüklenemiyorsa içe aktarma hata verir).
+# shellcheck disable=SC2016
+native_dogrula() {
+	(cd "$1" && calistir env D="$1" BEKLENEN="$1/packages/natives/native/$2" "$BUN" -e '
+		const d = process.env.D;
+		const n = await import(`${d}/packages/natives/native/index.js`);
+		const beklenen = (await Bun.file(`${d}/packages/natives/package.json`).json()).version;
+		const surum = typeof n.__piNativesBuildVersion === "function" ? n.__piNativesBuildVersion() : null;
+		let yol = null;
+		try {
+			yol = (await import(`${d}/packages/natives/native/loader-state.js`)).nativeAddonStatus?.()?.path ?? null;
+		} catch {}
+		console.log(`native: yol=${yol} sürüm=${surum} beklenen=${beklenen}`);
+		process.exit(surum === beklenen && (yol === null || yol === process.env.BEKLENEN) ? 0 : 1);')
+}
+
+surum_dogrula() {   # <sürüm dizini> <beklenen sürüm>
+	local cikti
+	cikti=$(cd "$1" && calistir "$BUN" "$1/packages/coding-agent/src/cli.ts" --version) || return 1
+	printf 'omp --version: %s\n' "$cikti" >&2
+	[[ $cikti == "omp/$2" ]]
+}
+
+# timeout --foreground: test, çağıranın süreç grubunda kalsın; omp aracı iptal edince o da dursun.
+test_dosyasi() { (cd "$1" && calistir "${TEST_ORTAMI[@]}" timeout --foreground -k 30 600 "$BUN" test "./$2"); }
+
+testleri_calistir() {   # <sürüm dizini>
+	local dosya paket goreli
+	for dosya in "${TEST_DOSYALARI[@]}"; do
+		[[ -f $1/$dosya ]] || continue
+		paket=${dosya#packages/}
+		paket=${paket%%/*}
+		goreli=${dosya#packages/"$paket"/}
+		bilgi "  test: $dosya"
+		test_dosyasi "$1/packages/$paket" "$goreli" && continue
+		bilgi "  test yeniden deneniyor: $dosya"
+		test_dosyasi "$1/packages/$paket" "$goreli" && continue
+		HAZIRLIK_HATASI="test başarısız: $dosya"
+		return 1
+	done
+}
+
+tip_denetimi() {   # <sürüm dizini>
+	local paket
+	for paket in "${YAMA_PAKETLERI[@]}"; do
+		if [[ ! -f $1/packages/$paket/package.json ]] || ! grep -q '"check:types"' "$1/packages/$paket/package.json"; then
+			continue
+		fi
+		bilgi "  tip denetimi: packages/$paket"
+		if ! (cd "$1/packages/$paket" && calistir timeout --foreground -k 30 1200 "$BUN" run check:types); then
+			HAZIRLIK_HATASI="tip denetimi başarısız: packages/$paket"
+			return 1
+		fi
+	done
+}
+
+# surum_hazirla <aday adı>: adayı surumler/<commit12>/ dizininde hazırlar ve doğrular; her şey
+# geçtiyse en son .omp-yama-bilgi'yi yazar. Dizini HAZIR_DIZIN'e koyar.
+surum_hazirla() {
+	local -n a=$1
+	local dizin=$ROOT/surumler/${a[commit]:0:12} varyant dosya glibc
+	HAZIRLIK_HATASI='' KALICI=1 HAZIR_DIZIN=$dizin
+	if [[ -f $dizin/$BILGI && $(manifest_oku "$dizin/$BILGI" COMMIT) == "${a[commit]}" ]]; then
+		bilgi "  önceden doğrulanmış sürüm dizini kullanılıyor: surumler/${a[commit]:0:12}"
+		return 0
+	fi
+	surum_dizinini_sil "$dizin"
+	varyant=$(cpu_varyanti)
+	if [[ $varyant == modern ]]; then dosya=$NATIVE_MODERN; else dosya=$NATIVE_BASELINE; fi
+	if [[ ${a[native_tur]} == release ]]; then
+		glibc=$(glibc_surumu)
+		if [[ $varyant != modern ]] || ! cpu_x86_64_v3; then
+			HAZIRLIK_HATASI="yayının native'i x86-64-v3 (AVX2) işlemci istiyor, bu sistem $varyant${PI_NATIVE_VARIANT:+ (PI_NATIVE_VARIANT=$PI_NATIVE_VARIANT)}"
+			KALICI=0
+			return 1
+		fi
+		if ! surum_en_az "${glibc:-0}" "${a[native_glibc]}"; then
+			HAZIRLIK_HATASI="yayının native'i glibc ${a[native_glibc]} istiyor, bu sistemde ${glibc:-?} var; sistemi güncelle: sudo pacman -Syu"
+			KALICI=0
+			return 1
+		fi
+	fi
+	if ! alan_denetle; then
+		HAZIRLIK_HATASI=$ALAN_HATASI KALICI=0
+		return 1
+	fi
+	bilgi "  çalışma ağacı çıkarılıyor: surumler/${a[commit]:0:12}"
+	mkdir -p "$ROOT/surumler"
+	calistir git --git-dir="$KAYNAK" -c core.hooksPath=/dev/null worktree add --quiet --detach "$dizin" "${a[commit]}" || true
+	if [[ ! -e $dizin/.git ]] || ! agac_butunlugu "$dizin" "${a[commit]}"; then
+		HAZIRLIK_HATASI="çalışma ağacı çıkarılamadı (ağ bağlantısını denetle)" KALICI=0
+		return 1
+	fi
+	bilgi "  bağımlılıklar kuruluyor (bun install)"
+	bun_kur "$dizin" || return 1
+	native_getir "$1" "$dosya" || return 1
+	if ! native_kur "$dizin" "$NATIVE_DOSYASI" "$dosya"; then
+		HAZIRLIK_HATASI="native yerleştirilemedi"
+		return 1
+	fi
+	bilgi "  doğrulanıyor: native modül, omp --version, ${#TEST_DOSYALARI[@]} test dosyası"
+	if ! native_dogrula "$dizin" "$dosya"; then
+		HAZIRLIK_HATASI="native modül yüklenemedi"
+		return 1
+	fi
+	if ! surum_dogrula "$dizin" "${a[surum]}"; then
+		HAZIRLIK_HATASI="omp --version omp/${a[surum]} vermedi"
+		return 1
+	fi
+	testleri_calistir "$dizin" || return 1
+	if [[ ${a[tip_denetimi]} == 1 ]]; then tip_denetimi "$dizin" || return 1; fi
+	if ! printf 'KIP=%s\nSURUM=%s\nCOMMIT=%s\nUPSTREAM=%s\nYAYIN_ZAMANI=%s\nNATIVE_ID=%s\nHAZIRLANMA=%s\n' \
+		"${a[kip]}" "${a[surum]}" "${a[commit]}" "${a[upstream]}" "${YAYIN[YAYIN_ZAMANI]}" "${a[native_id]}" \
+		"$(date -u +%FT%TZ)" >"$dizin/$BILGI.tmp" || ! mv -f "$dizin/$BILGI.tmp" "$dizin/$BILGI"; then
+		HAZIRLIK_HATASI="$BILGI yazılamadı"
+		return 1
+	fi
+}
+
+# aday_dene <aday adı> <canlı commit>: 0 = karar verildi (SONUC guncel ya da guncellendi),
+# 1 = aday kullanılamadı (M ise NEDEN'e, Y ise Y_NEDEN'e yazılır).
+aday_dene() {
+	local -n a=$1
+	local bilgi_satiri gerekli
+	KIP=${a[kip]} UPSTREAM=${a[upstream]}
+	if [[ ${a[commit]} == "$2" ]]; then
+		SONUC=guncel YENI=$ESKI
+		bilgi "canlı sürüm zaten bu: $ESKI"
+		return 0
+	fi
+	if ! bilgi_satiri=$(paket_bilgisi "${a[commit]}") || [[ $bilgi_satiri != *' '* ]]; then
+		aday_reddet "$1" "packages/utils/package.json okunamadı" 0
+		return 1
+	fi
+	a[surum]=${bilgi_satiri% *}
+	gerekli=${bilgi_satiri#* }
+	if [[ $gerekli != - ]] && ! surum_en_az "$BUN_SURUM" "$gerekli"; then
+		if [[ $BUN -ef $HOME/.bun/bin/bun ]]; then
+			bilgi "bu sürüm bun >= $gerekli istiyor; bun upgrade çalıştırılıyor"
+			calistir "$BUN" upgrade || true
+			BUN_SURUM=$(bun_surumu "$BUN")
+		fi
+		if ! surum_en_az "$BUN_SURUM" "$gerekli"; then
+			aday_reddet "$1" "bun-eski: bu sürüm bun >= $gerekli istiyor, kurulu bun $BUN_SURUM ($BUN)" 0
+			return 1
+		fi
+	fi
+	bilgi "hazırlanıyor: ${a[surum]} ${a[commit]:0:12} (${a[kip]}, ${a[upstream]})"
+	if surum_hazirla "$1"; then
+		gecis_yap "$HAZIR_DIZIN" || basarisiz "canli bağlantısı yeni sürüme çevrilemedi"
+		SONUC=guncellendi YENI=$(surum_ozeti "$ROOT/canli")
+		bilgi "canlı sürüm: $YENI"
+		return 0
+	fi
+	surum_dizinini_sil "$HAZIR_DIZIN"
+	aday_reddet "$1" "$HAZIRLIK_HATASI" "$KALICI"
+	return 1
+}
+
+aday_reddet() {   # <aday adı> <neden> <kalıcı (0/1)>: kalıcı hata adayı reddedilen'e yazar
+	local -n r=$1
+	local neden=$2
+	[[ $neden == bun-eski:* ]] || neden="dogrulama: $2 (${r[upstream]})"
+	if (($3)); then red_ekle "${r[commit]}" "$neden" || uyari "reddedilen listesine yazılamadı: $ROOT/reddedilen"; fi
+	if [[ $1 == M_ADAY ]]; then
+		NEDEN=$neden
+		bilgi "en yeni sürüm kullanılamadı: $NEDEN"
+	else
+		Y_NEDEN=$2
+		bilgi "test edilmiş sürüm hazırlanamadı: $2"
+	fi
+}
+
+# ---------------------------------------------------------------- geçiş, budama, bağlantılar
+
+# Bu bölümdeki işlevler de koşul içinde çağrılır; hatalarını açıkça döndürürler. Geçişten sonraki
+# bir hata canlı sürümü geri almaz, UYARI olarak bildirilir.
+
+gecis_yap() {   # <hazır sürüm dizini>
+	local yeni=surumler/${1##*/} eski
+	eski=$(readlink "$ROOT/canli" || true)
+	if [[ -n $eski && $eski != "$yeni" ]]; then
+		ln -sfn "$eski" "$ROOT/.onceki.tmp" && mv -T "$ROOT/.onceki.tmp" "$ROOT/onceki" || return 1
+	fi
+	ln -sfn "$yeni" "$ROOT/.canli.tmp" && mv -T "$ROOT/.canli.tmp" "$ROOT/canli"
+}
+
+# buda: canli ve onceki dışındaki sürüm dizinlerini ve kullanılmayan native önbelleklerini siler.
+buda() {
+	local tut=() kullanilan=() d ad
+	for d in canli onceki; do
+		[[ -L $ROOT/$d ]] || continue
+		ad=$(readlink "$ROOT/$d")
+		tut+=("${ad##*/}")
+		if [[ -f $ROOT/$d/$BILGI ]]; then kullanilan+=("$(manifest_oku "$ROOT/$d/$BILGI" NATIVE_ID)"); fi
+	done
+	for d in "$ROOT"/surumler/*/; do
+		d=${d%/}
+		ad=${d##*/}
+		if [[ " ${tut[*]} " != *" $ad "* ]]; then
+			bilgi "eski sürüm dizini siliniyor: surumler/$ad"
+			rm -rf "$d" || return 1
+		fi
+	done
+	calistir git --git-dir="$KAYNAK" worktree prune || return 1
+	for d in "$ROOT"/native/*/; do
+		d=${d%/}
+		ad=${d##*/}
+		if [[ " ${kullanilan[*]} " != *" $ad "* ]]; then rm -rf "$d" || return 1; fi
+	done
+}
+
+baslatici_yaz() {
+	local hedef=$ROOT/bin/omp yasak='["$`\\]'
+	if [[ $BUN$ROOT =~ $yasak || $BUN$ROOT == *$'\n'* ]]; then
+		uyari "bun ya da kurulum yolu başlatıcıya yazılamayan karakter içeriyor: $BUN, $ROOT"
+		return 1
+	fi
+	mkdir -p "$ROOT/bin" &&
+		printf '#!/bin/sh\n# omp-yamalari\nexec "%s" "%s/canli/packages/coding-agent/src/cli.ts" "$@"\n' \
+			"$BUN" "$ROOT" >"$hedef.tmp" &&
+		chmod 755 "$hedef.tmp" && mv -f "$hedef.tmp" "$hedef"
+}
+
+bizim_mi() { [[ -e $1 && $(readlink -f "$1") == "$(readlink -f "$ROOT/bin/omp")" ]]; }
+
+liste_ekle() {
+	mkdir -p "$ROOT/yedek" && printf '%s\t%s\n' "$1" "$2" >>"$ROOT/yedek/liste"
+}
+
+yedekle() {   # <yol>: yolu ROOT/yedek'e taşır ve listeye yazar
+	local n=1 yedek
+	mkdir -p "$ROOT/yedek" || return 1
+	if [[ -f $ROOT/yedek/liste ]]; then n=$(($(wc -l <"$ROOT/yedek/liste") + 1)); fi
+	yedek=$ROOT/yedek/$n-${1##*/}
+	mv -T "$1" "$yedek" && liste_ekle "$1" "$yedek" || return 1
+	bilgi "yedeklendi: $1 -> $yedek"
+}
+
+# baglanti_kur <yol> <hedef>: yoldakini yedekleyip yerine hedefe giden bir symlink koyar.
+baglanti_kur() {
+	local yol=$1 hedef=$2
+	if [[ -L $yol && $(readlink "$yol") == "$hedef" ]]; then return 0; fi
+	mkdir -p "${yol%/*}" || return 1
+	if [[ -L $yol && $(readlink "$yol") == "$ROOT"/* ]]; then
+		rm -f "$yol" || return 1
+	elif [[ -e $yol || -L $yol ]]; then
+		yedekle "$yol" || return 1
+	else
+		liste_ekle "$yol" - || return 1
+	fi
+	ln -sfn "$hedef" "$yol.omp-yama.tmp" && mv -T "$yol.omp-yama.tmp" "$yol" || return 1
+	bilgi "bağlandı: $yol -> $hedef"
+}
+
+omp_bagla() {
+	local p
+	hash -r
+	p=$(command -v omp || true)
+	[[ $p == /* ]] || p=
+	if [[ -n $p ]] && bizim_mi "$p"; then return 0; fi
+	if [[ -n $p && $p == "$HOME"/* && -w ${p%/*} ]]; then
+		baglanti_kur "$p" "$ROOT/bin/omp" || return 1
+	else
+		baglanti_kur "$HOME/.local/bin/omp" "$ROOT/bin/omp" || return 1
+	fi
+	hash -r
+	p=$(command -v omp || true)
+	if [[ $p != /* ]]; then
+		uyari "omp komutu PATH'te bulunamıyor; yamalı omp ~/.local/bin/omp'de. ~/.local/bin'i PATH'e ekle; bash/zsh: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc  fish: fish_add_path ~/.local/bin  (sonra terminali yeniden aç)"
+	elif ! bizim_mi "$p"; then
+		uyari "omp komutu hâlâ $p dosyasını çalıştırıyor; yamalı omp ~/.local/bin/omp'de. PATH'te ~/.local/bin, ${p%/*} dizininden önce gelmeli; bash/zsh: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc  fish: fish_add_path -m ~/.local/bin  (sonra terminali yeniden aç)"
+	fi
+}
+
+# ---------------------------------------------------------------- komutlar
+
+# y_atla: test edilmiş sürüm daha önce geri alındı ya da reddedildiyse canlı sürümde kalır (SONUC=guncel).
+# --test-edilmis listeye bakmaz; canlı sürüm yoksa da test edilmiş sürüm denenir.
+y_atla() {
+	local red m_neden=''
+	if ((TEST_EDILMIS)) || [[ -z $CANLI_COMMIT || ${Y_ADAY[commit]} == "$CANLI_COMMIT" ]]; then return 1; fi
+	red=$(red_nedeni "${Y_ADAY[commit]}")
+	[[ -n $red ]] || return 1
+	if [[ $NEDEN != - ]]; then m_neden=" (en yeni sürüm kullanılmadı: $NEDEN)"; fi
+	SONUC=guncel YENI=$ESKI
+	KIP=$(manifest_oku "$ROOT/canli/$BILGI" KIP) UPSTREAM=$(manifest_oku "$ROOT/canli/$BILGI" UPSTREAM)
+	NEDEN="test edilmiş sürüm ${Y_ADAY[commit]:0:12} daha önce geri alındı ya da reddedildi ($red); yeni yayın bekleniyor (yine de kurmak için: omp-yama guncelle --test-edilmis)$m_neden"
+	bilgi "test edilmiş sürüm ${Y_ADAY[commit]:0:12} atlandı ($red); canlı sürümde kalınıyor: $ESKI"
+}
+
+guncelleme_akisi() {
+	local ad m_neden
+	CANLI_COMMIT=''
+	if [[ -f $ROOT/canli/$BILGI ]]; then CANLI_COMMIT=$(manifest_oku "$ROOT/canli/$BILGI" COMMIT); fi
+	kaynak_hazirla
+	yayin_yukle
+	yama_listeleri
+	test_ortami_hazirla
+	y_hesapla
+	if ((TEST_EDILMIS)); then
+		NEDEN="istek: --test-edilmis"
+	else
+		m_hesapla
+	fi
+	SONUC=basarisiz
+	for ad in M_ADAY Y_ADAY; do
+		if [[ $ad == M_ADAY && -z ${M_ADAY[commit]:-} ]]; then continue; fi
+		if [[ $ad == Y_ADAY ]] && y_atla; then break; fi
+		if aday_dene "$ad" "$CANLI_COMMIT"; then break; fi
+	done
+	if [[ $SONUC == basarisiz ]]; then
+		m_neden=
+		if [[ $NEDEN != - ]]; then m_neden=" (en yeni sürüm kullanılmadı: $NEDEN)"; fi
+		basarisiz "test edilmiş sürüm hazırlanamadı: $Y_NEDEN$m_neden"
+	fi
+	if [[ $(manifest_oku "$ROOT/canli/$BILGI" COMMIT) == "${Y_ADAY[commit]}" ]] &&
+		{ ((TEST_EDILMIS)) || [[ $SONUC == guncellendi ]]; }; then
+		red_sil "${Y_ADAY[commit]}" || uyari "reddedilen listesi güncellenemedi: $ROOT/reddedilen"
+	fi
+	baslatici_yaz || uyari "başlatıcı yazılamadı: $ROOT/bin/omp"
+	omp_bagla || uyari "omp komutu yamalı sürüme bağlanamadı; ayrıntı günlükte"
+	baglanti_kur "$SKILL_YOLU" "$REPO/skill/omp-guncelle" || uyari "omp-guncelle skill'i bağlanamadı: $SKILL_YOLU"
+	buda || uyari "eski sürümler temizlenemedi; ayrıntı günlükte"
+	sonuc_yaz
+}
+
+komut_kur() {
+	ESKI=$(surum_ozeti "$ROOT/canli")
+	on_kosullar
+	baska_kaynak_denetle
+	repo_hazirla
+	guncelleme_akisi
+}
+
+komut_guncelle() {
+	ESKI=$(surum_ozeti "$ROOT/canli")
+	[[ -d $REPO/.git ]] || basarisiz "omp-yama kurulu değil; önce: omp-yama kur"
+	on_kosullar
+	repo_hazirla
+	guncelleme_akisi
+}
+
+# kontrol DURUM: guncelleme-var = yeni bir yayın var; upstream-yeni = yayın aynı, upstream'in daha yeni
+# bir kararlı sürümü var (guncelle onu yamalarla dener, olmazsa test edilmiş sürümde kalır); guncel.
+komut_kontrol() {
+	local yayin=$GECICI/yama.env url etiket durum=guncel b d red_sayisi=0
+	local -A satir=()
+	[[ -d $REPO/.git ]] || basarisiz "omp-yama kurulu değil; önce: omp-yama kur"
+	calistir git -C "$REPO" fetch --quiet origin || uyari "omp-yamalari deposu çekilemedi; son bilinen yayına bakılıyor"
+	mkdir -p "$GECICI"
+	git -C "$REPO" show origin/main:yama.env >"$yayin" || basarisiz "son yayın okunamadı (origin/main:yama.env)"
+	url=${OMP_UPSTREAM_URL:-$OMP_UPSTREAM_URL_VARSAYILAN}
+	if [[ -f $KAYNAK/HEAD ]]; then url=$(git --git-dir="$KAYNAK" config remote.origin.url); fi
+	etiket=$(kararli_etiketler "$url" | tail -n 1) || etiket=
+	for d in canli onceki; do
+		b=$ROOT/$d/$BILGI
+		satir[$d]=-
+		if [[ -f $b ]]; then
+			satir[$d]="$(surum_ozeti "$ROOT/$d") upstream=$(manifest_oku "$b" UPSTREAM) yayin=$(manifest_oku "$b" YAYIN_ZAMANI)"
+		fi
+	done
+	b=$ROOT/canli/$BILGI
+	if [[ ! -f $b || $(manifest_oku "$b" YAYIN_ZAMANI) != "$(manifest_oku "$yayin" YAYIN_ZAMANI)" ]]; then
+		durum=guncelleme-var
+	elif [[ -n $etiket ]] && ! surum_en_az "$(manifest_oku "$b" SURUM)" "${etiket#v}"; then
+		durum=upstream-yeni
+	fi
+	if [[ -f $ROOT/reddedilen ]]; then red_sayisi=$(wc -l <"$ROOT/reddedilen"); fi
+	d=$(manifest_oku "$yayin" TABAN)
+	SONUC_YAZILDI=1
+	cikti "CANLI=${satir[canli]}" "ONCEKI=${satir[onceki]}" \
+		"SON_YAYIN=$(manifest_oku "$yayin" SURUM) yayin=$(manifest_oku "$yayin" YAYIN_ZAMANI) taban=${d:0:12}" \
+		"UPSTREAM_SON=${etiket:--}" "DURUM=$durum" "REDDEDILEN=$red_sayisi" "GUNLUK=$GUNLUK"
+}
+
+# geri-al: canli ile onceki'yi değiştirir; geri alınan sürüm reddedilen'e yazılır, guncelle onu yeniden kurmaz.
+komut_geri_al() {
+	local canli onceki geri_alinan=''
+	canli=$(readlink "$ROOT/canli" || true)
+	onceki=$(readlink "$ROOT/onceki" || true)
+	ESKI=$(surum_ozeti "$ROOT/canli")
+	if [[ -z $onceki || ! -f $ROOT/$onceki/$BILGI ]]; then
+		SONUC_YAZILDI=1
+		cikti "SONUC=yapilamadi" "ESKI=$ESKI" "YENI=-" "NEDEN=geri dönülecek tamamlanmış bir önceki sürüm yok" "GUNLUK=$GUNLUK"
+		exit 1
+	fi
+	if [[ -f $ROOT/canli/$BILGI ]]; then geri_alinan=$(manifest_oku "$ROOT/canli/$BILGI" COMMIT); fi
+	ln -sfn "$onceki" "$ROOT/.canli.tmp"
+	mv -T "$ROOT/.canli.tmp" "$ROOT/canli"
+	if [[ -n $canli ]]; then
+		ln -sfn "$canli" "$ROOT/.onceki.tmp"
+		mv -T "$ROOT/.onceki.tmp" "$ROOT/onceki"
+	else
+		rm -f "$ROOT/onceki"
+	fi
+	if [[ -n $geri_alinan ]]; then
+		red_ekle "$geri_alinan" "geri-alindi: $(date -u +%FT%TZ)" ||
+			uyari "geri alınan sürüm reddedilen listesine yazılamadı; guncelle onu yeniden kurabilir"
+		bilgi "geri alınan sürüm ${geri_alinan:0:12} guncelle ile kendiliğinden yeniden kurulmaz"
+	fi
+	YENI=$(surum_ozeti "$ROOT/canli")
+	bilgi "canlı sürüm: $YENI (açık omp oturumlarını kapatıp yeniden aç)"
+	SONUC_YAZILDI=1
+	cikti "SONUC=geri-alindi" "ESKI=$ESKI" "YENI=$YENI" "NEDEN=-" "GUNLUK=$GUNLUK"
+}
+
+komut_kaldir() {
+	local satirlar=() i yol yedek ad
+	if [[ -f $ROOT/yedek/liste ]]; then mapfile -t satirlar <"$ROOT/yedek/liste"; fi
+	for ((i = ${#satirlar[@]} - 1; i >= 0; i--)); do
+		IFS=$'\t' read -r yol yedek <<<"${satirlar[i]}"
+		if [[ -L $yol && $(readlink "$yol") == "$ROOT"/* ]]; then
+			rm -f "$yol"
+			cikti "SILINDI=$yol"
+		fi
+		[[ $yedek != - ]] || continue
+		if [[ ! -e $yedek && ! -L $yedek ]]; then
+			uyari "yedek bulunamadı: $yedek ($yol geri konamadı)"
+		elif [[ -e $yol || -L $yol ]]; then
+			mv -T "$yedek" "$yol.omp-yamalari-yedek"
+			uyari "$yol dolu olduğu için eski hali $yol.omp-yamalari-yedek olarak bırakıldı"
+		else
+			mv -T "$yedek" "$yol"
+			cikti "GERI_KONDU=$yol"
+		fi
+	done
+	for yol in "$SKILL_YOLU" "$HOME/.local/bin/omp"; do
+		if [[ -L $yol && $(readlink "$yol") == "$ROOT"/* ]]; then
+			rm -f "$yol"
+			cikti "SILINDI=$yol"
+		fi
+	done
+	for ad in surumler kaynak.git kaynak.git.tmp repo repo.tmp native bin yedek gunluk gecici \
+		canli onceki .canli.tmp .onceki.tmp reddedilen kilit; do
+		rm -rf "${ROOT:?}/$ad"
+	done
+	if rmdir "$ROOT" 2>/dev/null; then
+		cikti "SILINDI=$ROOT"
+	else
+		uyari "$ROOT tamamen silinmedi: içinde omp-yama'ya ait olmayan dosyalar var"
+	fi
+	SONUC_YAZILDI=1
+	cikti "SONUC=kaldirildi" "GUNLUK=$GUNLUK"
+}
+
+main() {
+	ARGS=("$@")
+	local komut=${1:-}
+	shift || true
+	case $komut in
+	kur)
+		while (($# > 0)); do
+			[[ $1 == --zorla ]] || kullanim
+			ZORLA=1
+			shift
+		done
+		;;
+	guncelle)
+		while (($# > 0)); do
+			[[ $1 == --test-edilmis ]] || kullanim
+			TEST_EDILMIS=1
+			shift
+		done
+		;;
+	kontrol | geri-al | kaldir) (($# == 0)) || kullanim ;;
+	-h | --help | yardim) kullanim 0 ;;
+	*) kullanim ;;
+	esac
+	baslat "$komut"
+	case $komut in
+	kur) komut_kur ;;
+	guncelle) komut_guncelle ;;
+	kontrol) komut_kontrol ;;
+	geri-al) komut_geri_al ;;
+	kaldir) komut_kaldir ;;
+	esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+	main "$@"
+	exit
+fi

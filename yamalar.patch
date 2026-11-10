@@ -1,0 +1,4173 @@
+diff --git a/docs/settings.md b/docs/settings.md
+index 6fd1a639b3ca0daa8a6ea1c6dbfc03b706e064f9..1a0d8ee1e81d0dcfa4c19baa9f7dceaf2860cc7f 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -1019,6 +1019,7 @@ capability gating, model/request vetoes, hooks, chaining and recovery tradeoffs.
+ | `providers.streamIdleTimeoutSeconds`       | number  | `-1`       | Maximum silence between stream events, with the same `-1`/`0` conventions.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+ | `providers.anthropic.slowMode`             | enum    | `off`      | `off`, `auto`. Anthropic subscription low-priority recovery when a 5-hour limit is reached and the lane is offered; `/slow on` enables it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+ | `providers.openaiLiveSteering`             | boolean | `false`    | Deliver messages typed while a GPT-6 response streams into that response (`response.steer` over the Codex WebSocket) instead of waiting for the next tool boundary. Off by default; the Codex native turn lane can reject mid-response messages (`unsupported_native_inflight_message`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
++| `providers.cursorLiveSteering`             | boolean | `false`    | Deliver typed messages and background-job results into a running Cursor turn after each tool call, as a `conversation_action` user message, instead of when the turn ends. Input counts as delivered once Cursor reports it appended; otherwise it waits for the turn's end as before. A turn that fails with input unconfirmed turns this off until omp restarts. |
+ | `providers.openai-codex.daybreak`          | boolean | `true`     | Automatically request the Daybreak Blue cyber access program (`access_programs.cyber`) on ChatGPT accounts eligible for it. OpenAI may use content from Daybreak Blue sessions to improve its models; set `false` to opt out. Each session reads its own value. Does not cover dedicated Daybreak Blue models (`gpt-daybreak-blue-*`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+ | `providers.openrouterVariant`              | enum    | `default`  | `default`, `nitro`, `floor`, `online`, `exacto`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+ | `providers.kimiApiFormat`                  | enum    | `auto`     | `auto`, `openai`, `anthropic`. `auto` follows live model metadata.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+diff --git a/docs/tools/ask.md b/docs/tools/ask.md
+index 8f2e720960cdacf384ce09227d62fd3afcd1e125..3101fb1d4142b0f05fbcacc4e68a09837e92d4df 100644
+--- a/docs/tools/ask.md
++++ b/docs/tools/ask.md
+@@ -29,7 +29,7 @@ The form is plain semantic HTML. Controls: `<input type="radio">` (one-of), `typ
+    - timeout: `No answer before the timeout; submitted the form's current values:` followed by the JSON
+ - Form data (`HtmlFormData`): keyed by control `name`. A radio group or single `<select>` gives the chosen `value` (omitted when none); a checkbox group or `<select multiple>` gives an array; a lone checkbox gives its `value` when checked, else is omitted; `number`/`range` inputs give a number when the text parses; other text fields give their text; hidden inputs pass through. Disabled options and unnamed controls never appear.
+ - "Other" answers: every radio group and checkbox group of two or more options (not `<select>`) whose options include none labelled "Other…" gets a UI-supplied free-text "Other" answer (`ChoiceField.other`). The trimmed text is a radio group's value (`"db": "MySQL 8"`) or is appended to a checkbox group's array (`["ci", "terraform"]`); blank text is no answer. The fallback adds an `Other (type your own)` row that opens `input`; collab guests get the same row with an editor; ACP adds an optional `<name>_other` string property.
+-- `details: AskToolDetails`: `{ answers: { name, question, answer }[]; timedOut? }`, one entry per named field in form order. `question` is the field's label, else the text block right before it, else its section legend, else its name; `answer` shows option labels instead of values.
++- `details: AskToolDetails`: `{ answers: { name, question, answer }[]; data?; timedOut? }`, one `answers` entry per named field in form order. `question` is the field's label, else the text block right before it, else its section legend, else its name; `answer` shows option labels instead of values. `data` is the submitted form data, the same object the result text carries as JSON.
+ - Cancellation and headless cases throw instead of returning a structured success result. The tool does not stream updates.
+ 
+ ## Flow
+diff --git a/packages/agent/CHANGELOG.md b/packages/agent/CHANGELOG.md
+index 23616b19c8cd962b57d478f0626e92d362533f5e..120b33f0629b5cdd819c8b32f6335c190948084a 100644
+--- a/packages/agent/CHANGELOG.md
++++ b/packages/agent/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Live steering carries asides and answered input: a provider claiming with `{ asides: true }` also takes queued asides (background-job completions, sent as user input), and input it accepts with `acceptAnswered` is recorded right after the response without another model call. Live-taken asides go back to their producer when the response aborts or fails
++
+ ## [18.18.2] - 2026-11-08
+ 
+ ### Added
+diff --git a/packages/agent/src/agent-loop.ts b/packages/agent/src/agent-loop.ts
+index 2f99c21e97e7bb4aab5a89bfbdefbb67b68408ae..f91b7afc2aeb7b26c57a64cc8550a8648f63b112 100644
+--- a/packages/agent/src/agent-loop.ts
++++ b/packages/agent/src/agent-loop.ts
+@@ -11,6 +11,7 @@ import {
+ 	type Context,
+ 	EventStream,
+ 	isApiKeyResolver,
++	type Message,
+ 	type Model,
+ 	resolveApiKeyOnce,
+ 	seedApiKeyResolver,
+@@ -1262,9 +1263,13 @@ async function runLoopBody(
+ 
+ 	let pendingMessages: AgentMessage[] = [];
+ 	// Steering the provider took from the queue during the last response:
+-	// `liveAccepted` reached the model inside it, `liveDeferred` did not.
++	// `liveAccepted` reached the model inside it, `liveDeferred` did not, and
++	// `liveAnswered` reached it and was answered there. `liveAsides` are the
++	// asides among them, which settle through their own commit/discard hooks.
+ 	let liveAccepted: AgentMessage[] = [];
+ 	let liveDeferred: AgentMessage[] = [];
++	let liveAnswered: AgentMessage[] = [];
++	let liveAsides: AgentMessage[] = [];
+ 	const endAbortedBeforeModel = async (messages: AgentMessage[], turnOpen: boolean): Promise<boolean> => {
+ 		if (!signal?.aborted || !config.isUndeliveredQueuedMessage) return false;
+ 		const undelivered = new Set(messages.filter(message => config.isUndeliveredQueuedMessage?.(message)));
+@@ -1582,6 +1587,8 @@ async function runLoopBody(
+ 					if (channel) {
+ 						liveAccepted.push(...channel.accepted);
+ 						liveDeferred.push(...channel.deferred);
++						liveAnswered.push(...channel.answered);
++						liveAsides.push(...channel.asides);
+ 					}
+ 				}
+ 				if (recovered) {
+@@ -1647,6 +1654,9 @@ async function runLoopBody(
+ 					}
+ 					await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, { willContinue: false });
+ 					turnOpen = false;
++					// Live-taken steering is not recorded here, so the agent requeues it;
++					// asides go back to their producer instead.
++					discardAsides(liveAsides, new Error("Live-taken aside dropped by a failed response"));
+ 
+ 					stream.push(buildAgentEndEvent(newMessages, telemetry, stepCounter.count));
+ 					stream.end(newMessages);
+@@ -1829,6 +1839,23 @@ async function runLoopBody(
+ 				});
+ 				turnOpen = false;
+ 
++				if (signal?.aborted) {
++					// Live-taken asides do not return to the steering queue with the rest.
++					discardAsides(liveAsides, new Error("Live-taken aside dropped by an aborted response"));
++				} else if (liveAnswered.length > 0) {
++					// The model answered this input inside the response that just ended:
++					// record it after that response and continue from nothing.
++					for (const message of liveAnswered) {
++						if (message.role === "user") message.liveSteered = true;
++						currentContext.messages.push(message);
++						newMessages.push(message);
++						(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
++					}
++					emitInputMessages(stream, liveAnswered);
++				}
++				liveAnswered = [];
++				liveAsides = [];
++
+ 				if (isDeadlineExceeded(config.deadline)) {
+ 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+ 					return;
+@@ -1985,13 +2012,19 @@ function openLiveSteering(
+ 			if (messages.length > 0) config.onLiveSteeringTaken?.(messages);
+ 			return messages;
+ 		},
+-		toProvider: async (messages, signal) => {
++		takeAsides: async () => resolveAsides(await config.getAsideMessages?.("work")),
++		toProvider: async (messages, signal, options) => {
+ 			const transformed = config.transformContext
+ 				? await config.transformContext(messages, bound(signal))
+ 				: messages;
+ 			const converted = normalizeMessagesForProvider(await config.convertToLlm(transformed), prepared.model);
+ 			const userMessages: UserMessage[] = [];
+-			for (const message of converted) {
++			for (const entry of converted) {
++				// Asides convert to developer messages; a provider taking them sends them as user input.
++				const message: Message =
++					options?.asides && entry.role === "developer"
++						? { role: "user", content: entry.content, attribution: entry.attribution, timestamp: entry.timestamp }
++						: entry;
+ 				if (message.role !== "user") return undefined;
+ 				if (typeof message.content !== "string" && message.content.some(part => part.type === "image")) {
+ 					return undefined;
+diff --git a/packages/agent/src/live-steering.ts b/packages/agent/src/live-steering.ts
+index 3a01e13f2a43e97add7eadc71f946b2625bee495..b44c4586f6b34c5cff6eb9d0f9187a05caafb3df 100644
+--- a/packages/agent/src/live-steering.ts
++++ b/packages/agent/src/live-steering.ts
+@@ -2,12 +2,13 @@
+  * Agent side of provider live steering ({@link LiveSteering}).
+  *
+  * A provider that can put user input into the response it is streaming (OpenAI
+- * Responses `response.steer`) pulls queued steering through a
+- * {@link LiveSteeringChannel}. The loop records what the provider accepted right
+- * after that response, so the transcript matches what the model saw; anything
+- * it declined is injected at the next boundary like ordinary steering.
++ * Responses `response.steer`, a Cursor run's `conversation_action`) pulls queued
++ * steering through a {@link LiveSteeringChannel}. The loop records what the
++ * provider accepted right after that response, so the transcript matches what
++ * the model saw; anything it declined is injected at the next boundary like
++ * ordinary steering.
+  */
+-import type { LiveSteerClaim, LiveSteering, UserMessage } from "@oh-my-pi/pi-ai";
++import type { LiveSteerClaim, LiveSteerClaimOptions, LiveSteering, UserMessage } from "@oh-my-pi/pi-ai";
+ import { logger } from "@oh-my-pi/pi-utils";
+ import type { AgentMessage } from "./types";
+ 
+@@ -17,19 +18,30 @@ export interface LiveSteeringQueue {
+ 	wait(signal: AbortSignal): Promise<void>;
+ 	/** Dequeues the next steering batch. */
+ 	take(signal: AbortSignal): Promise<AgentMessage[]>;
++	/** Dequeues the queued non-interrupting asides (background-job completions). */
++	takeAsides(): Promise<AgentMessage[]>;
+ 	/**
+ 	 * Provider view of `messages` appended to the in-flight call's context, or
+-	 * `undefined` when that view is not purely user messages.
++	 * `undefined` when that view is not purely user messages. With `asides`,
++	 * developer messages count as user messages.
+ 	 */
+-	toProvider(messages: AgentMessage[], signal: AbortSignal): Promise<UserMessage[] | undefined>;
++	toProvider(
++		messages: AgentMessage[],
++		signal: AbortSignal,
++		options?: { asides?: boolean },
++	): Promise<UserMessage[] | undefined>;
+ }
+ 
+ /** One provider call's {@link LiveSteering} source. */
+ export class LiveSteeringChannel implements LiveSteering {
+ 	/** Steering the provider delivered into the in-flight response, in queue order. */
+ 	readonly accepted: AgentMessage[] = [];
++	/** Input the model received and answered inside the in-flight response, in queue order. */
++	readonly answered: AgentMessage[] = [];
+ 	/** Steering taken from the queue but not delivered; always queued after {@link accepted}. */
+ 	readonly deferred: AgentMessage[] = [];
++	/** Asides taken from the queue; they settle through their own commit/discard hooks. */
++	readonly asides: AgentMessage[] = [];
+ 	readonly #queue: LiveSteeringQueue;
+ 
+ 	constructor(queue: LiveSteeringQueue) {
+@@ -46,7 +58,7 @@ export class LiveSteeringChannel implements LiveSteering {
+ 		return promise;
+ 	}
+ 
+-	async claim(signal: AbortSignal): Promise<LiveSteerClaim | undefined> {
++	async claim(signal: AbortSignal, options?: LiveSteerClaimOptions): Promise<LiveSteerClaim | undefined> {
+ 		if (this.deferred.length > 0 || signal.aborted) return undefined;
+ 		let messages: AgentMessage[];
+ 		try {
+@@ -58,10 +70,21 @@ export class LiveSteeringChannel implements LiveSteering {
+ 			});
+ 			return undefined;
+ 		}
++		if (options?.asides && !signal.aborted) {
++			try {
++				const asides = await this.#queue.takeAsides();
++				this.asides.push(...asides);
++				messages = [...messages, ...asides];
++			} catch (error) {
++				logger.debug("Live aside dequeue failed", {
++					error: error instanceof Error ? error.message : String(error),
++				});
++			}
++		}
+ 		if (messages.length === 0) return undefined;
+ 		let providerMessages: UserMessage[] | undefined;
+ 		try {
+-			providerMessages = await this.#queue.toProvider(messages, signal);
++			providerMessages = await this.#queue.toProvider(messages, signal, { asides: options?.asides });
+ 		} catch (error) {
+ 			logger.debug("Live steering conversion failed", {
+ 				error: error instanceof Error ? error.message : String(error),
+@@ -79,6 +102,11 @@ export class LiveSteeringChannel implements LiveSteering {
+ 				settled = true;
+ 				this.accepted.push(...messages);
+ 			},
++			acceptAnswered: () => {
++				if (settled) return;
++				settled = true;
++				this.answered.push(...messages);
++			},
+ 			reject: () => {
+ 				if (settled) return;
+ 				settled = true;
+diff --git a/packages/agent/test/live-steering.test.ts b/packages/agent/test/live-steering.test.ts
+index b26557c6584feee9e9dcabde00db560e741755cd..8a5fd2d2bb1f8576fc31284ec607c4ec69472d60 100644
+--- a/packages/agent/test/live-steering.test.ts
++++ b/packages/agent/test/live-steering.test.ts
+@@ -2,14 +2,16 @@ import { describe, expect, it } from "bun:test";
+ import { type } from "@oh-my-pi/omptype";
+ import { Agent } from "@oh-my-pi/pi-agent-core";
+ import { agentLoop } from "@oh-my-pi/pi-agent-core/agent-loop";
+-import type {
+-	AgentContext,
+-	AgentEvent,
+-	AgentLoopConfig,
+-	AgentMessage,
+-	AgentTool,
+-	AgentToolContext,
+-	StreamFn,
++import {
++	ASIDE_MESSAGE_COMMIT,
++	ASIDE_MESSAGE_DISCARD,
++	type AgentContext,
++	type AgentEvent,
++	type AgentLoopConfig,
++	type AgentMessage,
++	type AgentTool,
++	type AgentToolContext,
++	type StreamFn,
+ } from "@oh-my-pi/pi-agent-core/types";
+ import type { LiveSteering, Message } from "@oh-my-pi/pi-ai";
+ import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+@@ -45,6 +47,8 @@ interface SteeredRunOptions {
+ 	first?: MockResponse;
+ 	tools?: AgentTool[];
+ 	getToolContext?: AgentLoopConfig["getToolContext"];
++	/** Queued non-interrupting asides (background-job completions). */
++	asides?: AgentMessage[];
+ }
+ 
+ /**
+@@ -75,6 +79,7 @@ async function runSteered(
+ 		convertToLlm,
+ 		getSteeringMessages: async () => queue.splice(0),
+ 		waitForSteeringMessages: async () => {},
++		getAsideMessages: async () => (setup.asides ?? []).splice(0),
+ 		getToolContext: setup.getToolContext,
+ 	};
+ 	const context: AgentContext = { systemPrompt: [""], messages: [], tools: setup.tools ?? [] };
+@@ -167,6 +172,80 @@ describe("agent loop live steering", () => {
+ 		expect(liveSteeredTexts(transcript)).toEqual([]);
+ 	});
+ 
++	it("records input the model answered inside the response right after it, without another model call", async () => {
++		const { contexts, transcript } = await runSteered(async (live, queue) => {
++			queue.push(createUserMessage("use tabs"));
++			(await live.claim(new AbortController().signal))?.acceptAnswered?.();
++		});
++
++		expect(contexts).toHaveLength(1);
++		expect(transcript.map(message => (message.role === "assistant" ? textOf(message) : userText(message)))).toEqual([
++			"start",
++			"first",
++			"use tabs",
++		]);
++		expect(liveSteeredTexts(transcript)).toEqual(["use tabs"]);
++	});
++
++	it("takes queued asides as user input only when asked, and commits them once recorded", async () => {
++		let committed = false;
++		const aside: AgentMessage = {
++			role: "custom",
++			customType: "async-result",
++			content: "job done",
++			display: false,
++			timestamp: Date.now(),
++		};
++		Object.defineProperty(aside, ASIDE_MESSAGE_COMMIT, {
++			value: () => {
++				committed = true;
++			},
++		});
++		let plainClaim: unknown = "unset";
++		let claimedView: string[] | undefined;
++		const { contexts, transcript } = await runSteered(
++			async live => {
++				const signal = new AbortController().signal;
++				plainClaim = await live.claim(signal);
++				const claim = await live.claim(signal, { asides: true });
++				claimedView = claim?.messages.map(textOf);
++				claim?.acceptAnswered?.();
++			},
++			{ asides: [aside] },
++		);
++
++		expect(plainClaim).toBeUndefined();
++		expect(claimedView).toEqual(["job done"]);
++		expect(contexts).toHaveLength(1);
++		expect(transcript.at(-1)).toBe(aside);
++		expect(committed).toBe(true);
++	});
++
++	it("returns live-taken asides to their producer when the response fails", async () => {
++		let discarded = false;
++		const aside: AgentMessage = {
++			role: "custom",
++			customType: "async-result",
++			content: "job done",
++			display: false,
++			timestamp: Date.now(),
++		};
++		Object.defineProperty(aside, ASIDE_MESSAGE_DISCARD, {
++			value: () => {
++				discarded = true;
++			},
++		});
++		const { transcript } = await runSteered(
++			async live => {
++				(await live.claim(new AbortController().signal, { asides: true }))?.acceptAnswered?.();
++			},
++			{ asides: [aside], first: { stopReason: "error", errorMessage: "boom" } },
++		);
++
++		expect(discarded).toBe(true);
++		expect(transcript).not.toContain(aside);
++	});
++
+ 	it("keeps steering whose provider view is not a user message out of the live response", async () => {
+ 		let claimed = true;
+ 		const card: AgentMessage = {
+diff --git a/packages/ai/CHANGELOG.md b/packages/ai/CHANGELOG.md
+index faca47f81c98e2ba5ced9324cf93b82ea5f71905..05b4346cc3546f288a7b23c7358a650c06a6506b 100644
+--- a/packages/ai/CHANGELOG.md
++++ b/packages/ai/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Added `CursorExecHandlers.askQuestion`: Cursor's native `AskQuestion` is answered through the host as one `ask` form instead of being rejected: a fieldset per question, radios for one pick and checkboxes for many. A typed "Other" answer is sent as `freeform_text`, and repeated option labels take distinct form values so every option stays answerable. Hosts without the handler, and async questions, are still rejected ([#16497](https://github.com/can1357/oh-my-pi/pull/16497) by [@morali](https://github.com/morali))
++- Added `CursorExecHandlers.subagent` and `subagentAwait`: Cursor's native `Task` runs on the host's subagents and returns their report instead of being rejected. Hosts without the handlers still reject it
++- Added host-run Cursor subagent types: `CursorExecHandlers.customSubagents` advertises them in the request context so Cursor's `Task` accepts the type, `artifactsFolder` names the folder `Task` may attach files from (`file_attachments`), and `CursorSubagentCall` carries the model Cursor picked (`modelId`) and the attached videos. `cursorVideos` (`CursorOptions.videos`) sends videos inline in the user message, which Gemini models read
++- Added mid-run live steering for Cursor: after each answered exec frame, queued user input and background-job completions go into the running turn as a `conversation_action` user message, recorded as answered once the server reports it appended (`user_message_appended`). Unconfirmed input returns to the caller for its next request, and a run that fails with input unconfirmed turns this off for the rest of the process. `LiveSteering.claim` takes `{ asides: true }`, and `LiveSteerClaim.acceptAnswered` reports input the model answered inside the response
++
+ ## [18.18.4] - 2026-11-09
+ 
+ ### Added
+diff --git a/packages/ai/src/providers/cursor.ts b/packages/ai/src/providers/cursor.ts
+index 5f6cfe97461b783ec8b674f993130fb3bd099604..c65231ca1d7aeef19f9dbdae328ec584677c8fb5 100644
+--- a/packages/ai/src/providers/cursor.ts
++++ b/packages/ai/src/providers/cursor.ts
+@@ -1,9 +1,12 @@
+ import * as fs from "node:fs/promises";
+ import http2 from "node:http2";
++import * as path from "node:path";
+ import { cursorModelParameters } from "@oh-my-pi/pi-catalog/compat/behavior";
+ import { isCursorMaxModeWireId } from "@oh-my-pi/pi-catalog/compat/collapse";
+ import { classifyModel, collapseVariantId } from "@oh-my-pi/pi-catalog/compat/taxonomy";
+ import type {
++	AskQuestionInteractionQuery,
++	AskQuestionResult,
+ 	ConversationStep,
+ 	CursorRule,
+ 	McpToolDefinition,
+@@ -45,6 +48,8 @@ import {
+ 	CursorRuleSource,
+ 	CursorRuleTypeGlobalSchema,
+ 	CursorRuleTypeSchema,
++	CustomSubagentPermissionMode,
++	CustomSubagentSchema,
+ 	DeleteErrorSchema,
+ 	DeleteRejectedSchema,
+ 	DeleteResultSchema,
+@@ -121,6 +126,7 @@ import {
+ 	ReadSuccessSchema,
+ 	RecordScreenFailureSchema,
+ 	RecordScreenResultSchema,
++	RequestContextEnvSchema,
+ 	RequestContextResultSchema,
+ 	RequestContextSchema,
+ 	RequestContextSuccessSchema,
+@@ -129,6 +135,7 @@ import {
+ 	ResumeActionSchema,
+ 	SelectedContextSchema,
+ 	SelectedImageSchema,
++	SelectedVideoSchema,
+ 	SetBlobResultSchema,
+ 	ShellAllowlistPrecheckResultSchema,
+ 	type ShellArgs,
+@@ -145,10 +152,18 @@ import {
+ 	ShellSuccessSchema,
+ 	SmartModeClassifierErrorSchema,
+ 	SmartModeClassifierResultSchema,
++	type SubagentArgs,
++	SubagentAwaitCompleteSchema,
++	SubagentAwaitErrorSchema,
+ 	SubagentAwaitNotFoundSchema,
++	type SubagentAwaitResult,
+ 	SubagentAwaitResultSchema,
++	SubagentAwaitStillRunningSchema,
++	SubagentBackgroundReason,
+ 	SubagentErrorSchema,
++	type SubagentResult,
+ 	SubagentResultSchema,
++	SubagentSuccessSchema,
+ 	ThinkingMessageSchema,
+ 	ToolCallSchema,
+ 	type TurnEndedUpdate,
+@@ -189,6 +204,7 @@ import type {
+ 	Api,
+ 	AssistantMessage,
+ 	Context,
++	CursorAskQuestionResult,
+ 	CursorExecFrameContext,
+ 	CursorExecHandlerResult,
+ 	CursorExecHandlers,
+@@ -196,10 +212,13 @@ import type {
+ 	CursorHistoryPayload,
+ 	CursorMcpCall,
+ 	CursorShellStreamCallbacks,
++	CursorSubagentAwaitOutcome,
++	CursorSubagentOutcome,
+ 	CursorTodoSnapshot,
+ 	CursorTodoSnapshotItem,
+ 	CursorTodoSyncHandler,
+ 	CursorToolResultHandler,
++	CursorVideoAttachment,
+ 	ImageContent,
+ 	Message,
+ 	Model,
+@@ -267,7 +286,14 @@ import {
+ 	shellDeadlineSeconds,
+ } from "./cursor/exec-modern";
+ import { CursorExecOrder } from "./cursor/exec-order";
+-import { handleInteractionQuery, protoUnknownFields } from "./cursor/interaction-query";
++import {
++	askQuestionRejected,
++	askQuestionSuccess,
++	cursorAskToolArgs,
++	handleInteractionQuery,
++	protoUnknownFields,
++} from "./cursor/interaction-query";
++import { CursorSteerInjector } from "./cursor/live-steering";
+ 
+ export const CURSOR_API_URL = CURSOR_DEFAULT_BASE_URL;
+ export { CURSOR_CLIENT_VERSION };
+@@ -452,6 +478,8 @@ export interface CursorOptions extends StreamOptions {
+ 	wireModelId?: string;
+ 	/** Run transport. `auto` starts with HTTP/2 and falls back on failed ALPN negotiation or a TLS reset. */
+ 	transport?: "auto" | "http2" | "http1";
++	/** Videos the active user message carries; only Gemini models read them. */
++	videos?: readonly CursorVideoAttachment[];
+ }
+ 
+ type CursorWireMode = "normalized" | "discovered";
+@@ -494,6 +522,12 @@ interface CursorTurnRecordState {
+ 	 * stand for all of them: none may be replayed from them.
+ 	 */
+ 	relayed: boolean;
++	/**
++	 * Live steering joined the run (`CursorSteerInjector`): its records hold
++	 * that input inside the turn, while the transcript records it after the
++	 * turn's message, so none may be replayed from them.
++	 */
++	steered: boolean;
+ }
+ 
+ /** An external executor's MCP call whose exec frame waits for the client's result. */
+@@ -1226,6 +1260,13 @@ function streamCursorWithWireMode(
+ 		// transport fails, and the error path finalizes the synthesized call just
+ 		// like the success path does.
+ 		const inFlightDispatches = new Set<Promise<void>>();
++		// Handlers that wait on the user (questions) would otherwise hold the
++		// drain until answered, and once the transport is done the answer has
++		// nowhere to go. Aborted on both exits, before their first drain.
++		const transportDone = new AbortController();
++		const dispatchSignal = options?.signal
++			? AbortSignal.any([options.signal, transportDone.signal])
++			: transportDone.signal;
+ 		// A dispatch can spawn another (a handler that decodes a nested frame), so
+ 		// re-check rather than awaiting one snapshot. Each dispatch already
+ 		// swallows its own rejection, so this only waits.
+@@ -1286,6 +1327,9 @@ function streamCursorWithWireMode(
+ 		// and pair the blocks it left open, and `state` itself is scoped to the
+ 		// try below.
+ 		let openBlockState: BlockState | undefined;
++		// Reachable from the catch: input it sent unconfirmed must go back to the
++		// caller before a retry or the error response.
++		let steer: CursorSteerInjector | undefined;
+ 		const settleH2 = (error?: unknown): void => {
+ 			if (h2Settled) return;
+ 			h2Settled = true;
+@@ -1357,6 +1401,7 @@ function streamCursorWithWireMode(
+ 			stored: new Map(),
+ 			given: new Map(),
+ 			relayed: false,
++			steered: false,
+ 		};
+ 		const hostOnToolResult = options?.onToolResult;
+ 		const onToolResult: CursorToolResultHandler | undefined = hostOnToolResult
+@@ -1607,6 +1652,29 @@ function streamCursorWithWireMode(
+ 				},
+ 			};
+ 
++			// A relayed run hands its step to the client between responses, where the
++			// loop already injects queued input.
++			steer =
++				options?.liveSteering && !relay && CursorSteerInjector.available
++					? new CursorSteerInjector(options.liveSteering, text => {
++							if (sawTurnEnded || h2Settled || resultTransport.closed) throw new Error("Cursor run ended");
++							const userMessage = createCursorUserMessage(text, text);
++							const action = create(ConversationActionSchema, {
++								action: {
++									case: "userMessageAction",
++									value: create(UserMessageActionSchema, { userMessage, sendToInteractionListener: true }),
++								},
++							});
++							const clientMessage = create(AgentClientMessageSchema, {
++								message: { case: "conversationAction", value: action },
++							});
++							resultWriter.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
++							log("conversationAction", "userMessageAction", { messageId: userMessage.messageId });
++							return userMessage.messageId;
++						})
++					: undefined;
++			const runSteer = steer;
++
+ 			runTransport.onResponse(headers => {
+ 				const protocol = transportMode === "http2" ? "HTTP/2" : "HTTP/1.1";
+ 				debugResponseLogPromise = debugSession?.openResponseLog(
+@@ -1659,9 +1727,21 @@ function streamCursorWithWireMode(
+ 					requestContextRules,
+ 					onConversationCheckpoint,
+ 					options?.externalToolExecutor,
+-				).catch(error => {
+-					log("error", "handleServerMessage", { error: String(error) });
+-				});
++					dispatchSignal,
++				)
++					.then(() => {
++						// An answered tool call is the run's step boundary: queued input joins here.
++						if (
++							runSteer &&
++							serverMessage.message.case === "execServerMessage" &&
++							serverMessage.message.value.message.case !== "requestContextArgs"
++						) {
++							return runSteer.afterExec();
++						}
++					})
++					.catch(error => {
++						log("error", "handleServerMessage", { error: String(error) });
++					});
+ 				inFlightDispatches.add(dispatch);
+ 				void dispatch.finally(() => inFlightDispatches.delete(dispatch));
+ 			};
+@@ -1726,6 +1806,10 @@ function streamCursorWithWireMode(
+ 						) {
+ 							checkpointCoversTurn = false;
+ 						}
++						if (interaction?.message.case === "userMessageAppended" && steer) {
++							steer.onAppended(interaction.message.value.userMessage);
++							if (steer.delivered) turnRecords.steered = true;
++						}
+ 						const isTurnEnded = interactionCase === "turnEnded";
+ 						// A parked run's response has ended: what Cursor sends meanwhile
+ 						// belongs to the response that resumes it, which replays it. Blob
+@@ -1932,6 +2016,7 @@ function streamCursorWithWireMode(
+ 				clearTimeout(relay.quietTimer);
+ 			}
+ 			await h2Completion.promise;
++			transportDone.abort();
+ 			state.execOrder?.close();
+ 			if (conversationId && baseConversationId && conversationId !== baseConversationId) {
+ 				successfulRotatedConversationIds.add(conversationId);
+@@ -1964,6 +2049,8 @@ function streamCursorWithWireMode(
+ 			// Results that flush and server-owned tools reported are still settling
+ 			// through the host; the digest must see them as the host stored them.
+ 			await drainInFlightDispatches();
++			// The loop reads what live steering delivered when this response ends.
++			await steer?.finish(false);
+ 			// A call handed to an external executor is still owed its result, which
+ 			// comes with the next request. The turn stops for the client to run it,
+ 			// however Cursor's model wound up its side after the handoff.
+@@ -1982,7 +2069,8 @@ function streamCursorWithWireMode(
+ 			let keptAsSent =
+ 				hashCursorUserMessage(userMessage) === turnRecords.userHash &&
+ 				!turnRecords.mixedRoutes &&
+-				!turnRecords.relayed;
++				!turnRecords.relayed &&
++				!turnRecords.steered;
+ 			for (const [callId, stored] of turnRecords.stored) {
+ 				if (hashCursorToolResult(stored) !== turnRecords.given.get(callId)) keptAsSent = false;
+ 			}
+@@ -2014,7 +2102,9 @@ function streamCursorWithWireMode(
+ 			});
+ 			stream.end();
+ 		} catch (caughtError) {
++			transportDone.abort(caughtError);
+ 			if (relay) clearTimeout(relay.quietTimer);
++			await steer?.finish(!options?.signal?.aborted);
+ 			let error = caughtError;
+ 			const h2Unavailable = transportMode === "http2" && isHttp2Unavailable(error);
+ 			if (h2Unavailable && isHttp2AlpnRejected(error)) http2Unavailable.set(model.baseUrl || CURSOR_API_URL, true);
+@@ -2464,6 +2554,7 @@ export async function handleServerMessage(
+ 	requestContextRules: CursorRule[] = [],
+ 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+ 	externalToolExecutor = false,
++	signal?: AbortSignal,
+ ): Promise<void> {
+ 	const msgCase = msg.message.case;
+ 
+@@ -2490,6 +2581,7 @@ export async function handleServerMessage(
+ 				stream,
+ 				state,
+ 				externalToolExecutor,
++				signal,
+ 			),
+ 		);
+ 	} else if (msgCase === "interactionQuery") {
+@@ -2498,8 +2590,17 @@ export async function handleServerMessage(
+ 		// waiting on a reply that never comes; the lazy idle watchdog then
+ 		// aborts a live stream with "Provider stream stalled while waiting for
+ 		// the next event" (cursor-grok-4.6-xhigh after a WebFetch/WebSearch
+-		// permission prompt).
+-		handleInteractionQuery(msg.message.value, runTransport);
++		// permission prompt). A question waits on the user, so it counts as
++		// local work for the idle watchdog.
++		const askQuestion = execHandlers?.askQuestion?.bind(execHandlers);
++		await stream.trackLocalWork(
++			handleInteractionQuery(
++				msg.message.value,
++				runTransport,
++				askQuestion &&
++					(query => answerAskQuestion(query, askQuestion, onToolResult, output, stream, state, signal)),
++			),
++		);
+ 	} else if (msgCase === "conversationCheckpointUpdate") {
+ 		handleConversationCheckpointUpdate(msg.message.value, output, onConversationCheckpoint);
+ 	}
+@@ -2951,6 +3052,7 @@ async function handleExecServerMessage(
+ 	stream: AssistantMessageEventStream,
+ 	state: BlockState,
+ 	externalToolExecutor: boolean,
++	signal?: AbortSignal,
+ ): Promise<void> {
+ 	const order = state.execOrder;
+ 	const execCase = execMsg.message.case;
+@@ -2968,6 +3070,7 @@ async function handleExecServerMessage(
+ 			stream,
+ 			state,
+ 			externalToolExecutor,
++			signal,
+ 			mcp.call,
+ 		);
+ 	if (!gated) return run();
+@@ -2994,11 +3097,13 @@ async function runExecServerMessage(
+ 	stream: AssistantMessageEventStream,
+ 	state: BlockState,
+ 	externalToolExecutor: boolean,
++	signal?: AbortSignal,
+ 	predecodedMcpCall?: CursorMcpCall,
+ ): Promise<void> {
+ 	const execCase = execMsg.message.case;
+ 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
+ 	if (execCase === "requestContextArgs") {
++		const artifactsFolder = execHandlers?.artifactsFolder?.();
+ 		const requestContext = create(RequestContextSchema, {
+ 			rules: requestContextRules,
+ 			repositoryInfo: [],
+@@ -3007,7 +3112,19 @@ async function runExecServerMessage(
+ 			projectLayouts: [],
+ 			mcpInstructions: [],
+ 			fileContents: {},
+-			customSubagents: [],
++			...(artifactsFolder ? { env: create(RequestContextEnvSchema, { artifactsFolder }) } : {}),
++			customSubagents: (execHandlers?.customSubagents?.() ?? []).map(subagent =>
++				create(CustomSubagentSchema, {
++					name: subagent.name,
++					description: subagent.description,
++					model: subagent.model,
++					prompt: subagent.prompt,
++					permissionMode: subagent.readonly
++						? CustomSubagentPermissionMode.READONLY
++						: CustomSubagentPermissionMode.DEFAULT,
++					forceDefaultModel: subagent.forceDefaultModel === true,
++				}),
++			),
+ 		});
+ 
+ 		const requestContextResult = create(RequestContextResultSchema, {
+@@ -3342,7 +3459,7 @@ async function runExecServerMessage(
+ 		}
+ 		case "mcpArgs": {
+ 			const args = execMsg.message.value;
+-			const mcpCall = predecodedMcpCall ?? decodeMcpCall(args);
++			const mcpCall: CursorMcpCall = { ...(predecodedMcpCall ?? decodeMcpCall(args)), signal };
+ 			// An approval probe, not an invocation: the frame asks whether the
+ 			// call would be permitted. Running the tool to find out fires a side
+ 			// effect the user has not been asked about, and fires it again when
+@@ -3813,26 +3930,42 @@ async function runExecServerMessage(
+ 		}
+ 		case "subagentArgs": {
+ 			const args = execMsg.message.value;
+-			const execResult = create(SubagentResultSchema, {
+-				result: {
+-					case: "error",
+-					value: create(SubagentErrorSchema, { error: `Subagents are ${NOT_IMPLEMENTED_SUFFIX}` }),
+-				},
++			log("exec", "subagent", {
++				subagentType: args.subagentType,
++				modelId: args.modelId,
++				videos: args.selectedContext?.selectedVideos.map(video => video.path),
+ 			});
+-			log("exec", "subagentRejected", { subagentType: args.subagentType });
++			const subagent = execHandlers?.subagent?.bind(execHandlers);
++			if (!subagent) {
++				log("exec", "subagentRejected", { subagentType: args.subagentType });
++				sendExecClientMessage(
++					runTransport,
++					execMsg,
++					"subagentResult",
++					buildSubagentErrorResult(`Subagents are ${NOT_IMPLEMENTED_SUFFIX}`),
++				);
++				return;
++			}
++			const execResult = await answerSubagent(args, subagent, onToolResult, output, stream, state, signal);
+ 			sendExecClientMessage(runTransport, execMsg, "subagentResult", execResult);
+ 			return;
+ 		}
+ 		case "subagentAwaitArgs": {
+-			// No subagent was ever spawned, so every awaited id is genuinely unknown.
+ 			const args = execMsg.message.value;
+-			const execResult = create(SubagentAwaitResultSchema, {
+-				result: {
+-					case: "notFound",
+-					value: create(SubagentAwaitNotFoundSchema, { agentId: args.agentId }),
+-				},
+-			});
+-			sendExecClientMessage(runTransport, execMsg, "subagentAwaitResult", execResult);
++			const subagentAwait = execHandlers?.subagentAwait?.bind(execHandlers);
++			// Without a handler no subagent was ever spawned, so every id is unknown.
++			const outcome: CursorSubagentAwaitOutcome = subagentAwait
++				? await subagentAwait({ agentId: args.agentId, timeoutMs: args.timeoutMs, signal }).catch(error => ({
++						status: "error" as const,
++						error: error instanceof Error ? error.message : String(error),
++					}))
++				: { status: "notFound" };
++			sendExecClientMessage(
++				runTransport,
++				execMsg,
++				"subagentAwaitResult",
++				buildSubagentAwaitResult(args.agentId, outcome),
++			);
+ 			return;
+ 		}
+ 		case "forceBackgroundShellArgs": {
+@@ -5786,7 +5919,7 @@ async function pairSynthesizedExecResult(
+ 	toolName: string,
+ 	text: string,
+ 	isError = true,
+-): Promise<void> {
++): Promise<ToolResultMessage> {
+ 	const synthesized: ToolResultMessage = {
+ 		role: "toolResult",
+ 		toolCallId,
+@@ -5795,9 +5928,171 @@ async function pairSynthesizedExecResult(
+ 		isError,
+ 		timestamp: Date.now(),
+ 	};
+-	const sink = onToolResult ?? state.onToolResult;
+-	if (!sink) return;
+-	await sink(synthesized);
++	return (await applyToolResultHandler(synthesized, onToolResult ?? state.onToolResult)) ?? synthesized;
++}
++
++const QUESTION_CANCELLED = "Question was cancelled";
++
++/**
++ * Run Cursor's native `AskQuestion` through the host's `ask` dialog and file
++ * it in the transcript as an `ask` call, like any other bridged native tool.
++ *
++ * An abort lets the Agent finalize the turn without waiting for the handler,
++ * and the synthesized block is already resolved, so nothing else pairs it. The
++ * cancellation result is therefore reported inside the abort event, before the
++ * Agent drains its Cursor result buffer; the handler's own late result is
++ * dropped.
++ */
++async function answerAskQuestion(
++	query: AskQuestionInteractionQuery,
++	handler: NonNullable<CursorExecHandlers["askQuestion"]>,
++	onToolResult: CursorToolResultHandler | undefined,
++	output: AssistantMessage,
++	stream: AssistantMessageEventStream,
++	state: BlockState,
++	signal: AbortSignal | undefined,
++): Promise<AskQuestionResult> {
++	if (signal?.aborted) return askQuestionRejected(QUESTION_CANCELLED);
++	const toolCallId = query.toolCallId || crypto.randomUUID();
++	const { args, fields } = cursorAskToolArgs(query.args);
++	synthesizeCursorExecToolCall(output, stream, state, toolCallId, "ask", args);
++	let cancellation: Promise<ToolResultMessage> | undefined;
++	const onAbort = (): void => {
++		cancellation = pairSynthesizedExecResult(state, onToolResult, toolCallId, "ask", QUESTION_CANCELLED);
++	};
++	signal?.addEventListener("abort", onAbort, { once: true });
++	let outcome: CursorAskQuestionResult | undefined;
++	let failure = "";
++	try {
++		outcome = await handler({ toolCallId, args, signal });
++	} catch (error) {
++		failure = error instanceof Error ? error.message : String(error);
++	} finally {
++		signal?.removeEventListener("abort", onAbort);
++	}
++	if (cancellation) return askQuestionRejected(toolResultToText(await cancellation) || QUESTION_CANCELLED);
++	if (!outcome) {
++		const recorded = await pairSynthesizedExecResult(state, onToolResult, toolCallId, "ask", failure);
++		return askQuestionRejected(toolResultToText(recorded) || failure);
++	}
++	const toolResult =
++		(await applyToolResultHandler(outcome.toolResult, onToolResult ?? state.onToolResult)) ?? outcome.toolResult;
++	// The answers are structured and cannot be re-derived from a rewritten
++	// result, so a host rewrite reaches Cursor as a rejection carrying its text
++	// rather than letting the original answers bypass it.
++	if (toolResult.isError || !outcome.data || toolResult !== outcome.toolResult) {
++		return askQuestionRejected(toolResultToText(toolResult) || "Question was not answered");
++	}
++	return askQuestionSuccess(query.args, fields, outcome.data);
++}
++
++const SUBAGENT_CANCELLED = "Subagent was cancelled";
++
++function buildSubagentErrorResult(error: string, agentId?: string): SubagentResult {
++	return create(SubagentResultSchema, {
++		result: { case: "error", value: create(SubagentErrorSchema, { agentId, error }) },
++	});
++}
++
++/**
++ * Run Cursor's native `Task` on the host's subagents and file it in the
++ * transcript as a `task` call. Aborts settle the same way as
++ * {@link answerAskQuestion}: the cancellation is paired inside the abort event
++ * and the handler's late result is dropped.
++ */
++async function answerSubagent(
++	args: SubagentArgs,
++	handler: NonNullable<CursorExecHandlers["subagent"]>,
++	onToolResult: CursorToolResultHandler | undefined,
++	output: AssistantMessage,
++	stream: AssistantMessageEventStream,
++	state: BlockState,
++	signal: AbortSignal | undefined,
++): Promise<SubagentResult> {
++	if (signal?.aborted) return buildSubagentErrorResult(SUBAGENT_CANCELLED);
++	const toolCallId = args.toolCallId || crypto.randomUUID();
++	synthesizeCursorExecToolCall(output, stream, state, toolCallId, "task", {
++		agent: args.subagentType || undefined,
++		task: args.prompt,
++	});
++	let cancellation: Promise<ToolResultMessage> | undefined;
++	const onAbort = (): void => {
++		cancellation = pairSynthesizedExecResult(state, onToolResult, toolCallId, "task", SUBAGENT_CANCELLED);
++	};
++	signal?.addEventListener("abort", onAbort, { once: true });
++	let outcome: CursorSubagentOutcome | undefined;
++	let failure = "";
++	try {
++		const videos = (args.selectedContext?.selectedVideos ?? []).map(video => ({
++			path: video.path,
++			mimeType: video.mimeType,
++		}));
++		outcome = await handler({
++			toolCallId,
++			subagentType: args.subagentType,
++			prompt: args.prompt,
++			...(args.modelId ? { modelId: args.modelId } : {}),
++			...(videos.length > 0 ? { videos } : {}),
++			signal,
++		});
++	} catch (error) {
++		failure = error instanceof Error ? error.message : String(error);
++	} finally {
++		signal?.removeEventListener("abort", onAbort);
++	}
++	if (cancellation) return buildSubagentErrorResult(toolResultToText(await cancellation) || SUBAGENT_CANCELLED);
++	if (!outcome) {
++		const recorded = await pairSynthesizedExecResult(state, onToolResult, toolCallId, "task", failure);
++		return buildSubagentErrorResult(toolResultToText(recorded) || failure);
++	}
++	const toolResult =
++		(await applyToolResultHandler(outcome.toolResult, onToolResult ?? state.onToolResult)) ?? outcome.toolResult;
++	if (toolResult.isError) {
++		return buildSubagentErrorResult(toolResultToText(toolResult) || "Subagent failed", outcome.agentId);
++	}
++	return create(SubagentResultSchema, {
++		result: {
++			case: "success",
++			value: create(SubagentSuccessSchema, {
++				agentId: outcome.agentId ?? toolCallId,
++				// A host rewrite replaces the report Cursor reads.
++				finalMessage: toolResult === outcome.toolResult ? outcome.finalMessage : toolResultToText(toolResult),
++				toolCallCount: 0,
++				// The host's async setting backgrounded it, not the model.
++				backgroundReason: outcome.background
++					? SubagentBackgroundReason.USER_REQUEST
++					: SubagentBackgroundReason.UNSPECIFIED,
++			}),
++		},
++	});
++}
++
++function buildSubagentAwaitResult(agentId: string, outcome: CursorSubagentAwaitOutcome): SubagentAwaitResult {
++	switch (outcome.status) {
++		case "complete":
++			return create(SubagentAwaitResultSchema, {
++				result: {
++					case: "complete",
++					value: create(SubagentAwaitCompleteSchema, {
++						agentId,
++						toolCallCount: 0,
++						finalMessage: outcome.finalMessage,
++					}),
++				},
++			});
++		case "running":
++			return create(SubagentAwaitResultSchema, {
++				result: { case: "stillRunning", value: create(SubagentAwaitStillRunningSchema, { agentId }) },
++			});
++		case "notFound":
++			return create(SubagentAwaitResultSchema, {
++				result: { case: "notFound", value: create(SubagentAwaitNotFoundSchema, { agentId }) },
++			});
++		case "error":
++			return create(SubagentAwaitResultSchema, {
++				result: { case: "error", value: create(SubagentAwaitErrorSchema, { agentId, error: outcome.error }) },
++			});
++	}
+ }
+ 
+ /** Exported for tests: drives one Cursor interaction update through the streaming state machine. */
+@@ -7122,15 +7417,25 @@ function createCursorUserMessage(
+ 	content: string | (TextContent | ImageContent)[],
+ 	text: string,
+ 	messageId = crypto.randomUUID(),
++	videos: readonly CursorVideoAttachment[] = [],
+ ) {
+ 	const images = typeof content === "string" ? [] : extractImages(content);
+ 	return create(UserMessageSchema, {
+ 		text,
+ 		messageId,
+-		...(images.length > 0
++		...(images.length > 0 || videos.length > 0
+ 			? {
+ 					selectedContext: create(SelectedContextSchema, {
+ 						selectedImages: images,
++						selectedVideos: videos.map(video =>
++							create(SelectedVideoSchema, {
++								uuid: crypto.randomUUID(),
++								path: video.path,
++								filename: path.basename(video.path),
++								mimeType: video.mimeType,
++								dataOrBlobId: { case: "data", value: video.data },
++							}),
++						),
+ 					}),
+ 				}
+ 			: {}),
+@@ -7326,7 +7631,7 @@ async function buildGrpcRequestForWireMode(
+ 				? {
+ 						case: "userMessageAction",
+ 						value: create(UserMessageActionSchema, {
+-							userMessage: createCursorUserMessage(userContent, userText),
++							userMessage: createCursorUserMessage(userContent, userText, undefined, options?.videos),
+ 						}),
+ 					}
+ 				: {
+diff --git a/packages/ai/src/providers/cursor/interaction-query.ts b/packages/ai/src/providers/cursor/interaction-query.ts
+index c49f2df6573b5a5baef97aba320db5b3bdcdb252..bbfa42d6a130e690e17d99421380d77053513611 100644
+--- a/packages/ai/src/providers/cursor/interaction-query.ts
++++ b/packages/ai/src/providers/cursor/interaction-query.ts
+@@ -1,8 +1,13 @@
+ import {
+ 	AgentClientMessageSchema,
++	type AskQuestionArgs,
++	type AskQuestionInteractionQuery,
+ 	AskQuestionInteractionResponseSchema,
+ 	AskQuestionRejectedSchema,
++	type AskQuestionResult,
+ 	AskQuestionResultSchema,
++	AskQuestionSuccess_AnswerSchema,
++	AskQuestionSuccessSchema,
+ 	CreatePlanErrorSchema,
+ 	CreatePlanRequestResponseSchema,
+ 	CreatePlanResultSchema,
+@@ -21,7 +26,8 @@ import {
+ 	WebSearchRequestResponseSchema,
+ } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+ import { create, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+-import { $env, logger } from "@oh-my-pi/pi-utils";
++import { $env, disambiguateDisplayLabels, escapeXmlAttribute, escapeXmlText, logger } from "@oh-my-pi/pi-utils";
++import type { CursorAskFormData } from "../../types";
+ import { frameConnectMessage } from "../connect-frame";
+ 
+ const NOT_IMPLEMENTED_SUFFIX = "not implemented by this client";
+@@ -92,6 +98,83 @@ function sendUnknownApprovedInteractionResponse(
+ 	log("interactionResponse", "unknownApproved", { id: queryId, field: fieldNo });
+ }
+ 
++/** Answers a native `AskQuestion` query; resolves with the result Cursor receives. */
++export type CursorAskQuestionResponder = (query: AskQuestionInteractionQuery) => Promise<AskQuestionResult>;
++
++export function askQuestionRejected(reason: string): AskQuestionResult {
++	return create(AskQuestionResultSchema, {
++		result: { case: "rejected", value: create(AskQuestionRejectedSchema, { reason }) },
++	});
++}
++
++/** One Cursor question as a form control: its `name`, and each option's `value` → Cursor option id. */
++export interface CursorAskField {
++	name: string;
++	optionIds: Map<string, string>;
++}
++
++/** Local `ask` kwargs for a Cursor `AskQuestion`, plus the control each question became. */
++export interface CursorAskPlan {
++	args: { html: string };
++	fields: CursorAskField[];
++}
++
++/**
++ * One `ask` form for a Cursor `AskQuestion`: a fieldset per question, radios
++ * for one pick and checkboxes for many; a question without options takes
++ * free text. Controls are named by position because Cursor allows missing and
++ * repeated question ids. An option's value is its label (a repeated label
++ * takes a numeric suffix), so the free-text "Other" answer the form adds to a
++ * group maps to an option only when it spells out that option's label.
++ */
++export function cursorAskToolArgs(args: AskQuestionArgs | undefined): CursorAskPlan {
++	const fields: CursorAskField[] = [];
++	let html = "<form>";
++	if (args?.title) html += `<h3>${escapeXmlText(args.title)}</h3>`;
++	for (const [index, question] of (args?.questions ?? []).entries()) {
++		const name = `q${index + 1}`;
++		const values = disambiguateDisplayLabels(
++			question.options.map(option => option.label),
++			[],
++		);
++		fields.push({ name, optionIds: new Map(values.map((value, i) => [value, question.options[i]!.id])) });
++		html += `<fieldset><legend>${escapeXmlText(question.prompt)}</legend>`;
++		if (values.length === 0) html += `<input type="text" name="${name}">`;
++		const type = question.allowMultiple ? "checkbox" : "radio";
++		for (const [i, value] of values.entries()) {
++			html += `<label><input type="${type}" name="${name}" value="${escapeXmlAttribute(value)}"> ${escapeXmlText(question.options[i]!.label)}</label>`;
++		}
++		html += "</fieldset>";
++	}
++	return { args: { html: `${html}</form>` }, fields };
++}
++
++/** The form answers by option value, Cursor by option id; text that names no option is the free-text answer. */
++export function askQuestionSuccess(
++	args: AskQuestionArgs | undefined,
++	fields: CursorAskField[],
++	data: CursorAskFormData,
++): AskQuestionResult {
++	const questions = args?.questions ?? [];
++	return create(AskQuestionResultSchema, {
++		result: {
++			case: "success",
++			value: create(AskQuestionSuccessSchema, {
++				answers: questions.map((question, index) => {
++					const field = fields[index];
++					const value = field ? data[field.name] : undefined;
++					const values = value === undefined ? [] : Array.isArray(value) ? value : [String(value)];
++					return create(AskQuestionSuccess_AnswerSchema, {
++						questionId: question.id,
++						selectedOptionIds: values.flatMap(picked => field?.optionIds.get(picked) ?? []),
++						freeformText: values.filter(picked => !field?.optionIds.has(picked)).join("\n"),
++					});
++				}),
++			}),
++		},
++	});
++}
++
+ /**
+  * Answer a Cursor `interaction_query` so the Run RPC can continue.
+  *
+@@ -101,10 +184,16 @@ function sendUnknownApprovedInteractionResponse(
+  * on heartbeats that are not semantic progress; the lazy idle watchdog then
+  * aborts with "Provider stream stalled while waiting for the next event".
+  *
+- * Unsupported interactive queries are rejected so the server is not stranded.
+- * VM setup is left unanswered rather than reporting a fake success.
++ * `AskQuestion` goes to `askQuestion` when the host can ask the user; async
++ * questions and hosts without a responder are rejected. Other unsupported
++ * interactive queries are rejected so the server is not stranded. VM setup is
++ * left unanswered rather than reporting a fake success.
+  */
+-export function handleInteractionQuery(query: InteractionQuery, h2Request: CursorInteractionWriter): void {
++export async function handleInteractionQuery(
++	query: InteractionQuery,
++	h2Request: CursorInteractionWriter,
++	askQuestion?: CursorAskQuestionResponder,
++): Promise<void> {
+ 	const queryCase = query.query.case;
+ 	log("interactionQuery", queryCase, query.query.value);
+ 	if (!queryCase) {
+@@ -153,21 +242,27 @@ export function handleInteractionQuery(query: InteractionQuery, h2Request: Curso
+ 				}),
+ 			});
+ 			return;
+-		case "askQuestionInteractionQuery":
++		case "askQuestionInteractionQuery": {
++			const ask = query.query.value;
++			let result: AskQuestionResult;
++			if (!askQuestion) {
++				result = askQuestionRejected(`Interactive questions are ${NOT_IMPLEMENTED_SUFFIX}`);
++			} else if (ask.args?.runAsync || ask.args?.asyncOriginalToolCallId) {
++				// `asyncOriginalToolCallId` marks the synthetic completion of an earlier async question.
++				result = askQuestionRejected(`Async questions are ${NOT_IMPLEMENTED_SUFFIX}`);
++			} else {
++				try {
++					result = await askQuestion(ask);
++				} catch (error) {
++					result = askQuestionRejected(error instanceof Error ? error.message : String(error));
++				}
++			}
+ 			sendInteractionResponse(h2Request, query.id, {
+ 				case: "askQuestionInteractionResponse",
+-				value: create(AskQuestionInteractionResponseSchema, {
+-					result: create(AskQuestionResultSchema, {
+-						result: {
+-							case: "rejected",
+-							value: create(AskQuestionRejectedSchema, {
+-								reason: `Interactive questions are ${NOT_IMPLEMENTED_SUFFIX}`,
+-							}),
+-						},
+-					}),
+-				}),
++				value: create(AskQuestionInteractionResponseSchema, { result }),
+ 			});
+ 			return;
++		}
+ 		case "switchModeRequestQuery":
+ 			sendInteractionResponse(h2Request, query.id, {
+ 				case: "switchModeRequestResponse",
+diff --git a/packages/ai/src/providers/cursor/live-steering.ts b/packages/ai/src/providers/cursor/live-steering.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7d3c9ca4a88923dd33f29bb446b81db66f3160b
+--- /dev/null
++++ b/packages/ai/src/providers/cursor/live-steering.ts
+@@ -0,0 +1,112 @@
++/**
++ * Mid-run steering for Cursor Agent runs.
++ *
++ * Cursor runs a whole turn, its local tool calls included, inside one response,
++ * so the agent loop reaches no step boundary to inject queued user input or
++ * background-job completions until the run ends. After each answered exec
++ * frame, {@link CursorSteerInjector} claims what the caller's
++ * {@link LiveSteering} source holds and sends it into the run as a
++ * `conversation_action` user message. The input counts as delivered only once
++ * the server reports it appended (`user_message_appended`); whatever is still
++ * unconfirmed when the run ends goes back to the caller for its next request.
++ * A run that fails with input unconfirmed turns injection off for the rest of
++ * the process.
++ *
++ * @example
++ * ```ts ignore
++ * const steer = new CursorSteerInjector(options.liveSteering, sendUserMessage);
++ * await steer.afterExec(); // after an exec frame is answered
++ * steer.onAppended(update.userMessage); // on `user_message_appended`
++ * await steer.finish(false); // before the response ends
++ * ```
++ */
++import { logger } from "@oh-my-pi/pi-utils";
++import type { LiveSteerClaim, LiveSteering } from "../../types";
++
++/** Writes one user message into the run and returns its message id; throws when the run takes no more input. */
++export type CursorSteerSend = (text: string) => string;
++
++let disabled = false;
++
++/** Feeds caller steering into one Cursor run, one unconfirmed message at a time. */
++export class CursorSteerInjector {
++	readonly #source: LiveSteering;
++	readonly #send: CursorSteerSend;
++	readonly #stop = new AbortController();
++	#pending: { claim: LiveSteerClaim; messageId: string; text: string } | undefined;
++	#claiming: Promise<void> | undefined;
++	/** Input reached the run: the server's records of the turn hold a message the request did not send. */
++	delivered = false;
++
++	constructor(source: LiveSteering, send: CursorSteerSend) {
++		this.#source = source;
++		this.#send = send;
++	}
++
++	/** False once a run failed with injected input unconfirmed. */
++	static get available(): boolean {
++		return !disabled;
++	}
++
++	/** Claims queued input and sends it into the run, unless a sent message still awaits confirmation. */
++	afterExec(): Promise<void> {
++		if (disabled || this.#stop.signal.aborted || this.#pending || this.#claiming) return Promise.resolve();
++		this.#claiming = this.#inject().finally(() => {
++			this.#claiming = undefined;
++		});
++		return this.#claiming;
++	}
++
++	/** Confirms the pending input when the server reports it appended to the run. */
++	onAppended(message: { messageId?: string; text?: string } | undefined): void {
++		const pending = this.#pending;
++		if (!pending || !message) return;
++		if (message.messageId !== pending.messageId && message.text?.trim() !== pending.text) return;
++		this.#pending = undefined;
++		this.delivered = true;
++		pending.claim.acceptAnswered?.();
++	}
++
++	/** Stops injecting; unconfirmed input goes back to the caller. Await before the response ends. */
++	async finish(failed: boolean): Promise<void> {
++		this.#stop.abort();
++		await this.#claiming;
++		const pending = this.#pending;
++		this.#pending = undefined;
++		if (!pending) return;
++		pending.claim.reject();
++		if (failed && !disabled) {
++			disabled = true;
++			logger.warn("Cursor live steering disabled: a run failed with steered input unconfirmed", {
++				messageId: pending.messageId,
++			});
++		}
++	}
++
++	async #inject(): Promise<void> {
++		const claim = await this.#source.claim(this.#stop.signal, { asides: true });
++		if (!claim) return;
++		// Images never reach a claim: live steering defers image-bearing input to the boundary.
++		const text = claim.messages
++			.map(message =>
++				typeof message.content === "string"
++					? message.content
++					: message.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n"),
++			)
++			.map(part => part.trim())
++			.filter(part => part.length > 0)
++			.join("\n\n");
++		if (this.#stop.signal.aborted || !claim.acceptAnswered || !text) {
++			claim.reject();
++			return;
++		}
++		try {
++			this.#pending = { claim, messageId: this.#send(text), text };
++		} catch (error) {
++			claim.reject();
++			logger.debug("Cursor steering send failed", {
++				error: error instanceof Error ? error.message : String(error),
++			});
++		}
++	}
++}
+diff --git a/packages/ai/src/providers/cursor/proto/agent.proto b/packages/ai/src/providers/cursor/proto/agent.proto
+index a25d277db0ff1892ba0dcfffb78d1d93c26c5cfa..20795fa2a3ccfee44e4eef1c30e004f75325a355 100644
+--- a/packages/ai/src/providers/cursor/proto/agent.proto
++++ b/packages/ai/src/providers/cursor/proto/agent.proto
+@@ -1129,6 +1129,8 @@ message AskQuestionSuccess_Answer {
+    string question_id = 1;
+    // empty if unanswered
+    repeated string selected_option_ids = 2;
++   // typed answer from the "Other" row
++   string freeform_text = 3;
+ }
+ 
+ message AskQuestionError {
+@@ -2572,6 +2574,8 @@ message RequestContextEnv {
+    string project_folder = 11;
+    // Folder where agent conversation transcripts are stored
+    string agent_transcripts_folder = 12;
++   // Folder whose files `Task` may attach (file_attachments) without the user attaching them
++   optional string artifacts_folder = 13;
+ }
+ 
+ message DebugModeConfig {
+@@ -2852,6 +2856,21 @@ message SelectedContext {
+    repeated SelectedGitPRDiffSelection git_pr_diff_selections = 20;
+    repeated SelectedPullRequest selected_pull_requests = 21;
+    repeated SelectedSubagent selected_subagents = 22;
++   repeated SelectedVideo selected_videos = 23;
++}
++
++// A video the user message carries; Cursor reads it only on Gemini models.
++message SelectedVideo {
++   oneof data_or_blob_id {
++      bytes blob_id = 1;
++      bytes data = 8;
++   }
++   string uuid = 2;
++   string path = 3;
++   optional float fps = 4;
++   string mime_type = 7;
++   string filename = 10;
++   bool materialize_to_filesystem = 12;
+ }
+ 
+ // InvocationContext represents the context from the external app/integration that triggered this agent request.
+@@ -3201,6 +3220,8 @@ message CustomSubagent {
+    string prompt = 6;
+    // default permission mode for subagent execution
+    int32 permission_mode = 7;
++   // run on `model` even when the caller asks for another
++   bool force_default_model = 13;
+ }
+ 
+ message SwitchModeArgs {
+@@ -4057,7 +4078,9 @@ enum ForceBackgroundSubagentStatus {
+ message SubagentArgs {
+    string tool_call_id = 1;
+    string subagent_type = 2;
++   string model_id = 3;
+    string prompt = 4;
++   SelectedContext selected_context = 17;
+ }
+ 
+ message SubagentSuccess {
+diff --git a/packages/ai/src/stream.ts b/packages/ai/src/stream.ts
+index 5def41af7f45c9b3c28e849d5c482813859b2980..b0be9aed95e5f5dff67b167e3db8b7b112a5a567 100644
+--- a/packages/ai/src/stream.ts
++++ b/packages/ai/src/stream.ts
+@@ -2326,6 +2326,7 @@ function mapOptionsForApi<TApi extends Api>(
+ 				execHandlers,
+ 				onToolResult,
+ 				externalToolExecutor: options?.cursorExternalToolExecutor,
++				videos: options?.cursorVideos,
+ 				wireModelId: resolveWireModelId(cursorModel, effort),
+ 			});
+ 		}
+diff --git a/packages/ai/src/types.ts b/packages/ai/src/types.ts
+index e69946b7d6e195af4c225590360509d196f42812..1a9f3aa0e2c022231180fc0f816b9038e6c0a13f 100644
+--- a/packages/ai/src/types.ts
++++ b/packages/ai/src/types.ts
+@@ -644,7 +644,8 @@ export interface StreamOptions {
+ 	minimizeEffort?: boolean;
+ 	/**
+ 	 * Source of user steering a provider may deliver into the response it is
+-	 * streaming (OpenAI Responses `response.steer` over the Codex WebSocket).
++	 * streaming (OpenAI Responses `response.steer` over the Codex WebSocket, a
++	 * Cursor `conversation_action` user message between exec frames).
+ 	 * Providers without mid-response input ignore it; unclaimed steering stays
+ 	 * with the caller for its next request.
+ 	 */
+@@ -776,7 +777,17 @@ export interface LiveSteering {
+ 	/** Resolves once steering may be claimable, or when `signal` aborts. Never consumes input. */
+ 	wait(signal: AbortSignal): Promise<void>;
+ 	/** Takes the queued steering as provider messages; `undefined` when none is deliverable now. */
+-	claim(signal: AbortSignal): Promise<LiveSteerClaim | undefined>;
++	claim(signal: AbortSignal, options?: LiveSteerClaimOptions): Promise<LiveSteerClaim | undefined>;
++}
++
++/** Options for {@link LiveSteering.claim}. */
++export interface LiveSteerClaimOptions {
++	/**
++	 * Also take queued non-interrupting asides (background-job completions), as
++	 * user messages. For providers that run tools inside one response and so
++	 * never reach the step boundary where the loop injects them.
++	 */
++	asides?: boolean;
+ }
+ 
+ /**
+@@ -787,6 +798,12 @@ export interface LiveSteerClaim {
+ 	readonly messages: readonly UserMessage[];
+ 	/** The server owns the input: the caller records it right after the current response. */
+ 	accept(): void;
++	/**
++	 * The model received the input inside the current response and answered it
++	 * there: the caller records it right after that response and continues from
++	 * nothing. Absent on sources that cannot record input that way.
++	 */
++	acceptAnswered?(): void;
+ 	/** Not delivered: the caller sends the input with its next request. */
+ 	reject(): void;
+ }
+@@ -836,6 +853,8 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
+ 	cursorOnToolResult?: CursorToolResultHandler;
+ 	/** The caller's client runs every tool: Cursor offers them all as MCP tools and hands each call off to it. */
+ 	cursorExternalToolExecutor?: boolean;
++	/** Videos the Cursor request's user message carries; only Gemini models read them. */
++	cursorVideos?: readonly CursorVideoAttachment[];
+ 	/**
+ 	 * Amazon Bedrock Guardrail settings forwarded through transports that do not
+ 	 * dispatch directly to the Bedrock provider. Model-level values take
+@@ -1461,8 +1480,87 @@ export interface CursorMcpCall {
+ 	 * not yet been asked about (and fire it twice once the real call arrives).
+ 	 */
+ 	approvalOnly?: boolean;
++	/** Aborted when the request is aborted or the Cursor stream ends; no result can reach Cursor after that. */
++	signal?: AbortSignal;
++}
++
++/** A native Cursor `AskQuestion` interaction, translated to local `ask` kwargs: one HTML form. */
++export interface CursorAskQuestionCall {
++	toolCallId: string;
++	args: Record<string, unknown>;
++	/** Aborted when the request is aborted or the Cursor stream ends; the answer is discarded after that. */
++	signal?: AbortSignal;
++}
++
++/** Submitted `ask` form data by control name: text, a number, or a checkbox group's values. */
++export type CursorAskFormData = Record<string, string | number | string[]>;
++
++export interface CursorAskQuestionResult {
++	toolResult: ToolResultMessage;
++	/** The form data the user submitted; absent when the question was not answered. */
++	data?: CursorAskFormData;
++}
++
++/** A native Cursor `Task` spawn. */
++export interface CursorSubagentCall {
++	toolCallId: string;
++	/** Cursor's subagent type, e.g. `explore` or `generalPurpose`. */
++	subagentType: string;
++	prompt: string;
++	/** The model Cursor picked for the subagent type, when it names one. */
++	modelId?: string;
++	/** Videos `Task` attached (`file_attachments`); Cursor forwards only paths under a trusted folder. */
++	videos?: CursorAttachedVideo[];
++	signal?: AbortSignal;
+ }
+ 
++/** A video file Cursor attached to a `Task` call, by path. */
++export interface CursorAttachedVideo {
++	path: string;
++	mimeType: string;
++}
++
++/** A video a Cursor request sends in its user message. Cursor reads videos only on Gemini models. */
++export interface CursorVideoAttachment extends CursorAttachedVideo {
++	data: Uint8Array;
++}
++
++/** A subagent type the host runs itself, advertised so Cursor's `Task` accepts it. */
++export interface CursorCustomSubagent {
++	name: string;
++	description: string;
++	/** Model the subagent runs on; Cursor sends it back as {@link CursorSubagentCall.modelId}. */
++	model: string;
++	prompt: string;
++	readonly?: boolean;
++	/** Keep {@link model} even when the caller asks for another. */
++	forceDefaultModel?: boolean;
++}
++
++export interface CursorSubagentOutcome {
++	toolResult: ToolResultMessage;
++	/** Id `subagentAwait` accepts; absent when nothing was spawned. */
++	agentId?: string;
++	/** The subagent's final report; absent while it runs in the background or after a failure. */
++	finalMessage?: string;
++	/** The subagent keeps running after this call returned. */
++	background: boolean;
++}
++
++/** Cursor waiting on a subagent an earlier `Task` call left running. */
++export interface CursorSubagentAwaitCall {
++	agentId: string;
++	/** Longest wait before answering `running`; `0` checks without waiting. */
++	timeoutMs: number;
++	signal?: AbortSignal;
++}
++
++export type CursorSubagentAwaitOutcome =
++	| { status: "complete"; finalMessage?: string }
++	| { status: "running" }
++	| { status: "notFound" }
++	| { status: "error"; error: string };
++
+ export interface CursorTodoSnapshotItem {
+ 	content: string;
+ 	status: "pending" | "in_progress" | "completed" | "abandoned";
+@@ -1640,6 +1738,31 @@ export interface CursorExecHandlers {
+ 		 */
+ 		downloadPath?: string;
+ 	}) => Promise<CursorMcpResourceContent | null>;
++	/**
++	 * Answer Cursor's native `AskQuestion` with the local `ask` dialog. Without
++	 * a handler the provider rejects the question; a handler whose session has
++	 * no `ask` tool (subagents, headless) returns an error result, which is
++	 * rejected too.
++	 *
++	 * The provider calls this once per query as it arrives and does not wait
++	 * for an open question; a handler backed by a single dialog must queue the
++	 * calls itself. If `onToolResult` replaces a successful result, Cursor
++	 * receives a rejection with the replacement's text instead of the answers.
++	 */
++	askQuestion?: (call: CursorAskQuestionCall) => Promise<CursorAskQuestionResult>;
++	/**
++	 * Cursor's native `Task`. Without a handler the spawn is refused. A
++	 * subagent left running answers later through {@link subagentAwait}.
++	 */
++	subagent?: (call: CursorSubagentCall) => Promise<CursorSubagentOutcome>;
++	subagentAwait?: (call: CursorSubagentAwaitCall) => Promise<CursorSubagentAwaitOutcome>;
++	/** Subagent types {@link subagent} runs beyond Cursor's built-ins; `Task` refuses any type not advertised. */
++	customSubagents?: () => readonly CursorCustomSubagent[];
++	/**
++	 * Folder whose files `Task` may attach (`file_attachments`). Cursor refuses
++	 * any other path the user did not attach to the conversation.
++	 */
++	artifactsFolder?: () => string | undefined;
+ 	/** Mirror Cursor's server-owned todo list into local session state. */
+ 	todoSync?: CursorTodoSyncHandler;
+ 	/**
+diff --git a/packages/ai/src/utils/glyph-codec.ts b/packages/ai/src/utils/glyph-codec.ts
+index 9599a22565cbccf93d90bb81a3107538afd86b06..53c90d6eb9d28ae3b5640a4fe27db70b948f71c3 100644
+--- a/packages/ai/src/utils/glyph-codec.ts
++++ b/packages/ai/src/utils/glyph-codec.ts
+@@ -34,7 +34,7 @@ export interface GlyphCodec {
+ 	context: Context;
+ 	/** Decodes glyph tokens live: text and tool-call deltas, partial snapshots, completed tool calls, and the terminal message. */
+ 	wrap(inner: AssistantMessageEventStream): AssistantMessageEventStream;
+-	/** Decodes Cursor Pi calls and encodes their provider-bound results. */
++	/** Decodes Cursor Pi and `AskQuestion` calls and encodes their provider-bound results. */
+ 	wrapCursorExecHandlers(handlers: CursorExecHandlers): CursorExecHandlers;
+ 	/** Whether this request has encoded at least one glyph or literal token prefix. */
+ 	active: boolean;
+@@ -624,6 +624,15 @@ function createCursorExecHandlersCodec(handlers: CursorExecHandlers, onEncoded:
+ 				return encodeCursorResult(result, onEncoded);
+ 			}
+ 		: undefined;
++	const sourceAskQuestion = handlers.askQuestion;
++	const askQuestion: CursorExecHandlers["askQuestion"] = sourceAskQuestion
++		? async call => {
++				const args = decodeCursorArgs(call.args);
++				const result = await sourceAskQuestion.call(handlers, args === call.args ? call : { ...call, args });
++				// Cursor maps option values back to option ids by its encoded labels; the tool result stays local.
++				return result.data ? { ...result, data: encodeCursorResult(result.data, onEncoded) } : result;
++			}
++		: undefined;
+ 
+ 	// Preserve class-backed handler objects; object spread drops prototype methods.
+ 	return new Proxy(handlers, {
+@@ -643,8 +652,13 @@ function createCursorExecHandlersCodec(handlers: CursorExecHandlers, onEncoded:
+ 					return piFind;
+ 				case "piLs":
+ 					return piLs;
+-				default:
+-					return Reflect.get(target, property, receiver);
++				case "askQuestion":
++					return askQuestion;
++				default: {
++					const value = Reflect.get(target, property, receiver);
++					// A method called on the proxy cannot reach the class's `#private` fields.
++					return typeof value === "function" ? value.bind(target) : value;
++				}
+ 			}
+ 		},
+ 	});
+diff --git a/packages/ai/test/cursor-exec-handlers.test.ts b/packages/ai/test/cursor-exec-handlers.test.ts
+index dad3880b7ebd70b3e52d0c76365c212d29d8c163..a9b428d82bbe4ba22d60e4fa9f6babc8b0777e32 100644
+--- a/packages/ai/test/cursor-exec-handlers.test.ts
++++ b/packages/ai/test/cursor-exec-handlers.test.ts
+@@ -4,6 +4,7 @@ import {
+ 	buildCursorHistoryForTest,
+ 	buildCursorRequestContextRules,
+ 	buildCursorSystemPromptJsons,
++	type CursorOptions,
+ 	emptyGrepPatternRejection,
+ 	handleServerMessage,
+ 	processInteractionUpdate,
+@@ -92,9 +93,14 @@ function cursorAssistant(
+ 	};
+ }
+ 
+-function captureCursorPayload(context: Context, model: Model<"cursor-agent"> = cursorModel): Promise<AgentRunRequest> {
++function captureCursorPayload(
++	context: Context,
++	model: Model<"cursor-agent"> = cursorModel,
++	options: Pick<CursorOptions, "videos"> = {},
++): Promise<AgentRunRequest> {
+ 	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
+ 	streamCursor(model, context, {
++		...options,
+ 		apiKey: "test-token",
+ 		onPayload: payload => {
+ 			if (isAgentRunRequest(payload)) {
+@@ -517,6 +523,29 @@ describe("Cursor request action encoding", () => {
+ 		}
+ 		expect(Array.from(selectedImage.dataOrBlobId.value)).toEqual(Array.from(Buffer.from(imageData, "base64")));
+ 	});
++
++	it("sends requested videos inline in the user message's selected context", async () => {
++		const payload = await captureCursorPayload(
++			{ messages: [{ role: "user", content: "What happens in the clip?", timestamp: 0 }] },
++			cursorModel,
++			{ videos: [{ path: "/work/artifacts/clip.mp4", mimeType: "video/mp4", data: Uint8Array.of(1, 2, 3) }] },
++		);
++
++		if (payload.action?.action.case !== "userMessageAction") {
++			throw new Error("Expected Cursor userMessageAction");
++		}
++		const userMessage = payload.action.action.value.userMessage;
++		expect(userMessage?.text).toBe("What happens in the clip?");
++		const videos = userMessage?.selectedContext?.selectedVideos ?? [];
++		expect(videos).toHaveLength(1);
++		expect(videos[0]).toMatchObject({
++			path: "/work/artifacts/clip.mp4",
++			filename: "clip.mp4",
++			mimeType: "video/mp4",
++		});
++		if (videos[0]?.dataOrBlobId.case !== "data") throw new Error("Expected inline video data");
++		expect(Array.from(videos[0].dataOrBlobId.value)).toEqual([1, 2, 3]);
++	});
+ });
+ 
+ describe("Cursor history encoding", () => {
+@@ -1510,6 +1539,62 @@ describe("Cursor exec local-work tracking (issue #4593)", () => {
+ 		expect(written.length).toBe(1);
+ 	});
+ 
++	it("passes the request abort signal to the MCP handler", async () => {
++		const controller = new AbortController();
++		const signals: (AbortSignal | undefined)[] = [];
++		const serverMsg = create(AgentServerMessageSchema, {
++			message: {
++				case: "execServerMessage",
++				value: create(ExecServerMessageSchema, {
++					id: 1,
++					execId: "exec-mcp-ask",
++					message: {
++						case: "mcpArgs",
++						value: create(McpArgsSchema, {
++							name: "ask",
++							toolName: "ask",
++							toolCallId: "call-mcp-ask",
++							providerIdentifier: "pi-agent",
++							args: {},
++						}),
++					},
++				}),
++			},
++		});
++		const execHandlers: CursorExecHandlers = {
++			async mcp(call) {
++				signals.push(call.signal);
++				return {
++					role: "toolResult",
++					toolCallId: call.toolCallId,
++					toolName: call.toolName,
++					content: [{ type: "text", text: "Ask input was cancelled" }],
++					isError: true,
++					timestamp: 1,
++				};
++			},
++		};
++
++		await handleServerMessage(
++			serverMsg,
++			cursorAssistantMessage(),
++			new AssistantMessageEventStream(),
++			newBlockState(),
++			new Map(),
++			{ write: () => true } as unknown as Parameters<typeof handleServerMessage>[5],
++			execHandlers,
++			undefined,
++			{ sawTokenDelta: false },
++			[],
++			[],
++			undefined,
++			false,
++			controller.signal,
++		);
++
++		expect(signals).toEqual([controller.signal]);
++	});
++
+ 	it("synthesizes an MCP call while preserving opaque string arguments", async () => {
+ 		const output = cursorAssistantMessage();
+ 		const stream = new AssistantMessageEventStream();
+diff --git a/packages/ai/test/cursor-exec-modern.test.ts b/packages/ai/test/cursor-exec-modern.test.ts
+index 346c33c332c270ac74b5814bd83b24dbe397c2a6..513a3d9a15f6a7a3c402ca55adc3e2c00080b9e8 100644
+--- a/packages/ai/test/cursor-exec-modern.test.ts
++++ b/packages/ai/test/cursor-exec-modern.test.ts
+@@ -7,7 +7,12 @@ import {
+ 	processInteractionUpdate,
+ 	type ToolCallState,
+ } from "@oh-my-pi/pi-ai/providers/cursor";
+-import type { AssistantMessage, CursorExecHandlers, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
++import type {
++	AssistantMessage,
++	CursorExecHandlers,
++	CursorSubagentCall,
++	ToolResultMessage,
++} from "@oh-my-pi/pi-ai/types";
+ import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+ import {
+@@ -30,6 +35,7 @@ import {
+ 	ConversationStateStructureSchema,
+ 	ConversationTokenDetailsSchema,
+ 	type CursorRule,
++	CustomSubagentPermissionMode,
+ 	type ExecServerMessage,
+ 	ExecServerMessageSchema,
+ 	ExecuteHookArgsSchema,
+@@ -59,6 +65,8 @@ import {
+ 	ReadMcpResourceExecArgsSchema,
+ 	RecordScreenArgsSchema,
+ 	RequestContextArgsSchema,
++	SelectedContextSchema,
++	SelectedVideoSchema,
+ 	ShellAllowlistPrecheckArgsSchema,
+ 	ShellArgsSchema,
+ 	SmartModeClassifierArgsSchema,
+@@ -231,6 +239,51 @@ describe("Cursor requestContext rules", () => {
+ 		expect(rules[1]?.content).toContain(canary);
+ 		expect(rules[1]?.type?.type.case).toBe("global");
+ 	});
++
++	const requestContextFor = async (execHandlers?: CursorExecHandlers) => {
++		const { frames } = await dispatchExec(
++			buildExecMessage({ case: "requestContextArgs", value: create(RequestContextArgsSchema, {}) }),
++			{ execHandlers },
++		);
++		const result = soleResult(frames);
++		if (result.case !== "requestContextResult" || result.value.result.case !== "success") {
++			throw new Error("expected a successful requestContextResult");
++		}
++		return result.value.result.value.requestContext;
++	};
++
++	it("advertises the host's own subagent types and the folder Task may attach from", async () => {
++		const requestContext = await requestContextFor({
++			customSubagents: () => [
++				{
++					name: "videoReview",
++					description: "Watch videos",
++					model: "gemini-3.1-pro",
++					prompt: "You watch videos.",
++					readonly: true,
++					forceDefaultModel: true,
++				},
++			],
++			artifactsFolder: () => "/work/artifacts",
++		});
++		expect(requestContext?.customSubagents).toEqual([
++			expect.objectContaining({
++				name: "videoReview",
++				description: "Watch videos",
++				model: "gemini-3.1-pro",
++				prompt: "You watch videos.",
++				permissionMode: CustomSubagentPermissionMode.READONLY,
++				forceDefaultModel: true,
++			}),
++		]);
++		expect(requestContext?.env?.artifactsFolder).toBe("/work/artifacts");
++	});
++
++	it("sends no environment and no custom subagents when the host has none", async () => {
++		const requestContext = await requestContextFor();
++		expect(requestContext?.customSubagents).toEqual([]);
++		expect(requestContext?.env).toBeUndefined();
++	});
+ });
+ 
+ describe("Cursor conversation checkpoints", () => {
+@@ -612,6 +665,112 @@ describe("Cursor modern exec frames: no answer carries an unset oneof", () => {
+ 	});
+ });
+ 
++describe("Cursor native Task runs on the host's subagents", () => {
++	const taskResult = (text: string, isError = false): ToolResultMessage => ({
++		role: "toolResult",
++		toolCallId: "c1",
++		toolName: "task",
++		content: [{ type: "text", text }],
++		isError,
++		timestamp: 0,
++	});
++	const subagentFrame = buildExecMessage({
++		case: "subagentArgs",
++		value: create(SubagentArgsSchema, { toolCallId: "c1", subagentType: "explore", prompt: "find the word" }),
++	});
++
++	it("answers with the subagent's report and pairs a task call in the transcript", async () => {
++		const calls: { subagentType: string; prompt: string }[] = [];
++		const { frames, output, results } = await dispatchExec(subagentFrame, {
++			execHandlers: {
++				subagent: async call => {
++					calls.push({ subagentType: call.subagentType, prompt: call.prompt });
++					return {
++						toolResult: taskResult("PAPAYA"),
++						agentId: "Scout1",
++						finalMessage: "PAPAYA",
++						background: false,
++					};
++				},
++			},
++		});
++		expect(calls).toEqual([{ subagentType: "explore", prompt: "find the word" }]);
++		const answer = soleResult(frames);
++		if (answer.case !== "subagentResult") throw new Error(`got ${answer.case}`);
++		if (answer.value.result.case !== "success") throw new Error(`got ${answer.value.result.case}`);
++		expect(answer.value.result.value.agentId).toBe("Scout1");
++		expect(answer.value.result.value.finalMessage).toBe("PAPAYA");
++		const block = output.content.find(item => item.type === "toolCall");
++		expect(block?.type === "toolCall" && block.name).toBe("task");
++		expect(results.map(result => result.toolCallId)).toEqual(["c1"]);
++	});
++
++	it("hands the handler the model Cursor picked and the videos Task attached", async () => {
++		const calls: CursorSubagentCall[] = [];
++		await dispatchExec(
++			buildExecMessage({
++				case: "subagentArgs",
++				value: create(SubagentArgsSchema, {
++					toolCallId: "c1",
++					subagentType: "videoReview",
++					modelId: "gemini-3.1-pro",
++					prompt: "What happens?",
++					selectedContext: create(SelectedContextSchema, {
++						selectedVideos: [
++							create(SelectedVideoSchema, { path: "/work/artifacts/clip.mp4", mimeType: "video/mp4" }),
++						],
++					}),
++				}),
++			}),
++			{
++				execHandlers: {
++					subagent: async call => {
++						calls.push(call);
++						return { toolResult: taskResult("A cat jumps."), finalMessage: "A cat jumps.", background: false };
++					},
++				},
++			},
++		);
++		expect(calls).toEqual([
++			expect.objectContaining({
++				subagentType: "videoReview",
++				modelId: "gemini-3.1-pro",
++				videos: [{ path: "/work/artifacts/clip.mp4", mimeType: "video/mp4" }],
++			}),
++		]);
++	});
++
++	it("reports a failed subagent as an error, not a success without a report", async () => {
++		const { frames } = await dispatchExec(subagentFrame, {
++			execHandlers: {
++				subagent: async () => ({ toolResult: taskResult("agent crashed", true), background: false }),
++			},
++		});
++		const answer = soleResult(frames);
++		if (answer.case !== "subagentResult") throw new Error(`got ${answer.case}`);
++		if (answer.value.result.case !== "error") throw new Error(`got ${answer.value.result.case}`);
++		expect(answer.value.result.value.error).toContain("agent crashed");
++	});
++
++	it("maps each await outcome onto Cursor's await result", async () => {
++		const awaitFrame = buildExecMessage({
++			case: "subagentAwaitArgs",
++			value: create(SubagentAwaitArgsSchema, { agentId: "Scout1", timeoutMs: 1000 }),
++		});
++		const answerFor = async (outcome: Awaited<ReturnType<NonNullable<CursorExecHandlers["subagentAwait"]>>>) => {
++			const { frames } = await dispatchExec(awaitFrame, { execHandlers: { subagentAwait: async () => outcome } });
++			const answer = soleResult(frames);
++			if (answer.case !== "subagentAwaitResult") throw new Error(`got ${answer.case}`);
++			return answer.value.result;
++		};
++		const complete = await answerFor({ status: "complete", finalMessage: "done" });
++		expect(complete.case === "complete" && complete.value.finalMessage).toBe("done");
++		expect((await answerFor({ status: "running" })).case).toBe("stillRunning");
++		const failed = await answerFor({ status: "error", error: "boom" });
++		expect(failed.case === "error" && failed.value.error).toBe("boom");
++	});
++});
++
+ describe("Cursor MCP resource frames answer from the host's servers", () => {
+ 	it("returns the resources the host advertises, with their server names", async () => {
+ 		// The empty catalog above is the no-handler fallback. A host holding live
+diff --git a/packages/ai/test/cursor-interaction-query.test.ts b/packages/ai/test/cursor-interaction-query.test.ts
+index 552bc6a3bae8454e74cec6994a0ba679cdc6be7d..7a8d87e6185375fb64b8b6f066dc05d6ba9027d9 100644
+--- a/packages/ai/test/cursor-interaction-query.test.ts
++++ b/packages/ai/test/cursor-interaction-query.test.ts
+@@ -1,11 +1,22 @@
+ import { describe, expect, it } from "bun:test";
+ import { type BlockState, handleServerMessage, type ToolCallState } from "@oh-my-pi/pi-ai/providers/cursor";
+-import type { AssistantMessage } from "@oh-my-pi/pi-ai/types";
++import { cursorAskToolArgs } from "@oh-my-pi/pi-ai/providers/cursor/interaction-query";
++import type {
++	AssistantMessage,
++	CursorAskQuestionCall,
++	CursorAskQuestionResult,
++	CursorExecHandlers,
++	ToolResultMessage,
++} from "@oh-my-pi/pi-ai/types";
+ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+ import {
+ 	type AgentClientMessage,
+ 	AgentClientMessageSchema,
+ 	AgentServerMessageSchema,
++	type AskQuestionArgs,
++	AskQuestionArgs_OptionSchema,
++	AskQuestionArgs_QuestionSchema,
++	AskQuestionArgsSchema,
+ 	AskQuestionInteractionQuerySchema,
+ 	CreatePlanRequestQuerySchema,
+ 	ExaFetchRequestQuerySchema,
+@@ -75,7 +86,13 @@ function decodeConnectFrame(frame: Buffer): AgentClientMessage {
+ 	return fromBinary(AgentClientMessageSchema, frame.subarray(5));
+ }
+ 
+-async function dispatchQuery(query: InteractionQuery): Promise<Buffer[]> {
++async function dispatchQuery(
++	query: InteractionQuery,
++	execHandlers?: CursorExecHandlers,
++	onToolResult?: (result: ToolResultMessage) => ToolResultMessage | undefined,
++	output: AssistantMessage = cursorAssistantMessage(),
++	signal?: AbortSignal,
++): Promise<Buffer[]> {
+ 	const frames: Buffer[] = [];
+ 	const h2Request = {
+ 		write(chunk: Buffer) {
+@@ -88,19 +105,306 @@ async function dispatchQuery(query: InteractionQuery): Promise<Buffer[]> {
+ 	});
+ 	await handleServerMessage(
+ 		serverMsg,
+-		cursorAssistantMessage(),
++		output,
+ 		new AssistantMessageEventStream(),
+ 		emptyBlockState(),
+ 		new Map(),
+ 		h2Request,
+-		undefined,
+-		undefined,
++		execHandlers,
++		onToolResult,
+ 		{ sawTokenDelta: false },
+ 		[],
++		[],
++		undefined,
++		false,
++		signal,
+ 	);
+ 	return frames;
+ }
+ 
++function storageArgs(asyncFlags: { runAsync?: boolean; asyncOriginalToolCallId?: string } = {}): AskQuestionArgs {
++	return create(AskQuestionArgsSchema, {
++		title: "Pick storage",
++		...asyncFlags,
++		questions: [
++			create(AskQuestionArgs_QuestionSchema, {
++				id: "db",
++				prompt: "Database?",
++				options: [
++					create(AskQuestionArgs_OptionSchema, { id: "sqlite", label: "SQLite" }),
++					create(AskQuestionArgs_OptionSchema, { id: "pg", label: "Postgres" }),
++				],
++			}),
++			create(AskQuestionArgs_QuestionSchema, {
++				id: "extras",
++				prompt: "Extras?",
++				allowMultiple: true,
++				options: [
++					create(AskQuestionArgs_OptionSchema, { id: "cache", label: "Cache" }),
++					create(AskQuestionArgs_OptionSchema, { id: "queue", label: "Queue" }),
++				],
++			}),
++		],
++	});
++}
++
++/** The form controls the storage questions become. */
++const [dbField, extrasField] = cursorAskToolArgs(storageArgs()).fields;
++
++function askQuery(
++	id: number,
++	asyncFlags: { runAsync?: boolean; asyncOriginalToolCallId?: string } = {},
++): InteractionQuery {
++	return create(InteractionQuerySchema, {
++		id,
++		query: {
++			case: "askQuestionInteractionQuery",
++			value: create(AskQuestionInteractionQuerySchema, { toolCallId: "tool_ask_1", args: storageArgs(asyncFlags) }),
++		},
++	});
++}
++
++function askToolResult(text: string, isError = false): ToolResultMessage {
++	return {
++		role: "toolResult",
++		toolCallId: "tool_ask_1",
++		toolName: "ask",
++		content: [{ type: "text", text }],
++		isError,
++		timestamp: 1,
++	};
++}
++
++describe("cursor native AskQuestion bridge", () => {
++	it("answers through the host ask form and maps the submitted values back to option ids", async () => {
++		const calls: CursorAskQuestionCall[] = [];
++		const recorded: ToolResultMessage[] = [];
++		const output = cursorAssistantMessage();
++		const frames = await dispatchQuery(
++			askQuery(30),
++			{
++				askQuestion: async (call): Promise<CursorAskQuestionResult> => {
++					calls.push(call);
++					return {
++						toolResult: askToolResult("User answers: …"),
++						data: { [dbField!.name]: "Postgres", [extrasField!.name]: ["Cache", "Queue", "and a CDN"] },
++					};
++				},
++			},
++			result => {
++				recorded.push(result);
++			},
++			output,
++		);
++
++		expect(calls).toHaveLength(1);
++		expect(output.content).toMatchObject([
++			{ type: "toolCall", id: "tool_ask_1", name: "ask", arguments: { html: expect.any(String) } },
++		]);
++		expect(recorded).toMatchObject([{ toolCallId: "tool_ask_1", toolName: "ask", isError: false }]);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			id: 30,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: {
++					result: {
++						result: {
++							case: "success",
++							value: {
++								answers: [
++									{ questionId: "db", selectedOptionIds: ["pg"], freeformText: "" },
++									{ questionId: "extras", selectedOptionIds: ["cache", "queue"], freeformText: "and a CDN" },
++								],
++							},
++						},
++					},
++				},
++			},
++		});
++	});
++
++	it("records the cancellation inside the abort event and drops the handler's late result", async () => {
++		// The Agent finalizes an aborted turn without waiting for the provider; the
++		// resolved `ask` block is paired only if its result is reserved by then.
++		const controller = new AbortController();
++		const recorded: ToolResultMessage[] = [];
++		const handlerStarted = Promise.withResolvers<void>();
++		const release = Promise.withResolvers<void>();
++		const dispatched = dispatchQuery(
++			askQuery(37),
++			{
++				askQuestion: async () => {
++					handlerStarted.resolve();
++					await release.promise;
++					return { toolResult: askToolResult("Ask input was cancelled", true) };
++				},
++			},
++			result => {
++				recorded.push(result);
++				return result;
++			},
++			undefined,
++			controller.signal,
++		);
++		await handlerStarted.promise;
++		controller.abort();
++
++		expect(recorded).toMatchObject([
++			{
++				toolCallId: "tool_ask_1",
++				toolName: "ask",
++				isError: true,
++				content: [{ type: "text", text: "Question was cancelled" }],
++			},
++		]);
++		release.resolve();
++		const frames = await dispatched;
++		expect(recorded).toHaveLength(1);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			id: 37,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: { result: { result: { case: "rejected", value: { reason: "Question was cancelled" } } } },
++			},
++		});
++	});
++
++	it("rejects a question that arrives after the abort without filing it", async () => {
++		const controller = new AbortController();
++		controller.abort();
++		const output = cursorAssistantMessage();
++		let called = false;
++		const frames = await dispatchQuery(
++			askQuery(38),
++			{
++				askQuestion: async () => {
++					called = true;
++					return { toolResult: askToolResult("unreachable") };
++				},
++			},
++			undefined,
++			output,
++			controller.signal,
++		);
++		expect(called).toBe(false);
++		expect(output.content).toEqual([]);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			result: { value: { result: { result: { case: "rejected" } } } },
++		});
++	});
++
++	it("calls a class-method handler with its own receiver", async () => {
++		class Handlers implements CursorExecHandlers {
++			#answer = "Postgres";
++			async askQuestion(): Promise<CursorAskQuestionResult> {
++				return { toolResult: askToolResult("User answers: …"), data: { [dbField!.name]: this.#answer } };
++			}
++		}
++		const frames = await dispatchQuery(askQuery(33), new Handlers());
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			id: 33,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: {
++					result: {
++						result: {
++							case: "success",
++							value: {
++								answers: [
++									{ questionId: "db", selectedOptionIds: ["pg"] },
++									{ questionId: "extras", selectedOptionIds: [] },
++								],
++							},
++						},
++					},
++				},
++			},
++		});
++	});
++
++	it("rejects with the host-rewritten text when ask fails", async () => {
++		const frames = await dispatchQuery(
++			askQuery(35),
++			{ askQuestion: async () => ({ toolResult: askToolResult("token sk-123 rejected", true) }) },
++			result => ({ ...result, content: [{ type: "text", text: "token [redacted] rejected" }] }),
++		);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			id: 35,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: { result: { result: { case: "rejected", value: { reason: "token [redacted] rejected" } } } },
++			},
++		});
++	});
++
++	it("records a failed ask and rejects with the host-rewritten text when the handler throws", async () => {
++		const recorded: ToolResultMessage[] = [];
++		const frames = await dispatchQuery(
++			askQuery(36),
++			{
++				askQuestion: async () => {
++					throw new Error("dialog crashed at /secret/path");
++				},
++			},
++			result => {
++				recorded.push(result);
++				return { ...result, content: [{ type: "text", text: "dialog crashed" }] };
++			},
++		);
++		expect(recorded).toMatchObject([{ toolCallId: "tool_ask_1", toolName: "ask", isError: true }]);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			id: 36,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: { result: { result: { case: "rejected", value: { reason: "dialog crashed" } } } },
++			},
++		});
++	});
++
++	it("does not send the original answers when the host rewrites a successful ask", async () => {
++		const frames = await dispatchQuery(
++			askQuery(39),
++			{
++				askQuestion: async () => ({
++					toolResult: askToolResult('User answers: db: "my password is hunter2"'),
++					data: { [dbField!.name]: "my password is hunter2" },
++				}),
++			},
++			result => ({ ...result, content: [{ type: "text", text: "User answers: db: [redacted]" }] }),
++		);
++		const response = decodeConnectFrame(frames[0]!).message.value;
++		expect(response).toMatchObject({
++			id: 39,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: { result: { result: { case: "rejected", value: { reason: "User answers: db: [redacted]" } } } },
++			},
++		});
++		expect(JSON.stringify(response)).not.toContain("hunter2");
++	});
++
++	it.each([
++		["async questions", { runAsync: true }],
++		["an async question's completion frame", { asyncOriginalToolCallId: "tool_ask_0" }],
++	])("rejects %s without opening the dialog", async (_label, asyncFlags) => {
++		let called = false;
++		const frames = await dispatchQuery(askQuery(32, asyncFlags), {
++			askQuestion: async () => {
++				called = true;
++				return { toolResult: askToolResult("unreachable") };
++			},
++		});
++		expect(called).toBe(false);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			id: 32,
++			result: {
++				case: "askQuestionInteractionResponse",
++				value: { result: { result: { case: "rejected", value: { reason: expect.stringContaining("Async") } } } },
++			},
++		});
++	});
++});
++
+ describe("cursor interaction query handshake", () => {
+ 	it("approves hosted web search so the Run RPC can continue", async () => {
+ 		const frames = await dispatchQuery(
+@@ -223,3 +527,68 @@ describe("cursor interaction query handshake", () => {
+ 		expect(empty).toEqual([]);
+ 	});
+ });
++
++describe("cursor native AskQuestion option mapping", () => {
++	function collidingArgs(): AskQuestionArgs {
++		const option = (id: string, label: string) => create(AskQuestionArgs_OptionSchema, { id, label });
++		return create(AskQuestionArgsSchema, {
++			questions: [
++				create(AskQuestionArgs_QuestionSchema, {
++					id: "go",
++					prompt: "Proceed?",
++					options: [option("yes_now", "Yes"), option("yes_later", "Yes"), option("other", "Other")],
++				}),
++				create(AskQuestionArgs_QuestionSchema, {
++					id: "go",
++					prompt: "Which parts?",
++					allowMultiple: true,
++					options: [option("done", "Done"), option("all", "All")],
++				}),
++				create(AskQuestionArgs_QuestionSchema, {
++					prompt: "Notes?",
++					options: [option("none", "Other")],
++				}),
++			],
++		});
++	}
++
++	it("keeps every Cursor option id reachable when labels and question ids repeat", async () => {
++		const [proceed, parts, notes] = cursorAskToolArgs(collidingArgs()).fields;
++		const secondYes = [...proceed!.optionIds.keys()][1]!;
++		const frames = await dispatchQuery(
++			create(InteractionQuerySchema, {
++				id: 40,
++				query: {
++					case: "askQuestionInteractionQuery",
++					value: create(AskQuestionInteractionQuerySchema, { toolCallId: "tool_ask_1", args: collidingArgs() }),
++				},
++			}),
++			{
++				askQuestion: async (): Promise<CursorAskQuestionResult> => ({
++					toolResult: askToolResult("User answers: …"),
++					data: { [proceed!.name]: secondYes, [parts!.name]: ["Done", "All"], [notes!.name]: "Other" },
++				}),
++			},
++		);
++
++		expect(new Set([proceed!.name, parts!.name, notes!.name]).size).toBe(3);
++		expect(decodeConnectFrame(frames[0]!).message.value).toMatchObject({
++			result: {
++				value: {
++					result: {
++						result: {
++							case: "success",
++							value: {
++								answers: [
++									{ questionId: "go", selectedOptionIds: ["yes_later"], freeformText: "" },
++									{ questionId: "go", selectedOptionIds: ["done", "all"], freeformText: "" },
++									{ questionId: "", selectedOptionIds: ["none"], freeformText: "" },
++								],
++							},
++						},
++					},
++				},
++			},
++		});
++	});
++});
+diff --git a/packages/ai/test/cursor-live-steering.test.ts b/packages/ai/test/cursor-live-steering.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a6a2bc30fa04536688f0eba27b328d52a222a0d
+--- /dev/null
++++ b/packages/ai/test/cursor-live-steering.test.ts
+@@ -0,0 +1,130 @@
++import { describe, expect, it } from "bun:test";
++import { CursorSteerInjector } from "@oh-my-pi/pi-ai/providers/cursor/live-steering";
++import type { LiveSteerClaim, LiveSteerClaimOptions, LiveSteering, UserMessage } from "@oh-my-pi/pi-ai/types";
++
++type Outcome = "answered" | "rejected" | undefined;
++
++/** A source handing out `batches` one per claim; records each claim's options and outcome. */
++function steeringSource(batches: UserMessage[][]): {
++	source: LiveSteering;
++	outcomes: Outcome[];
++	claimOptions: (LiveSteerClaimOptions | undefined)[];
++} {
++	const outcomes: Outcome[] = [];
++	const claimOptions: (LiveSteerClaimOptions | undefined)[] = [];
++	const source: LiveSteering = {
++		wait: async () => {},
++		claim: async (_signal, options): Promise<LiveSteerClaim | undefined> => {
++			claimOptions.push(options);
++			const messages = batches.shift();
++			if (!messages) return undefined;
++			const index = outcomes.push(undefined) - 1;
++			return {
++				messages,
++				accept: () => {
++					throw new Error("Cursor steering never leaves input to a successor request");
++				},
++				acceptAnswered: () => {
++					outcomes[index] = "answered";
++				},
++				reject: () => {
++					outcomes[index] = "rejected";
++				},
++			};
++		},
++	};
++	return { source, outcomes, claimOptions };
++}
++
++function user(content: UserMessage["content"]): UserMessage {
++	return { role: "user", content, timestamp: Date.now() };
++}
++
++describe("CursorSteerInjector", () => {
++	it("sends claimed input, asides included, as one user message and records it answered once Cursor appends it", async () => {
++		const { source, outcomes, claimOptions } = steeringSource([
++			[user("use tabs"), user([{ type: "text", text: " job bg_1 finished " }])],
++		]);
++		const sent: string[] = [];
++		const steer = new CursorSteerInjector(source, text => {
++			sent.push(text);
++			return "message-1";
++		});
++
++		await steer.afterExec();
++
++		expect(claimOptions).toEqual([{ asides: true }]);
++		expect(sent).toEqual(["use tabs\n\njob bg_1 finished"]);
++		expect(outcomes).toEqual([undefined]);
++
++		// Another message's echo does not confirm it.
++		steer.onAppended({ messageId: "message-0", text: "older input" });
++		expect(outcomes).toEqual([undefined]);
++		expect(steer.delivered).toBe(false);
++
++		steer.onAppended({ messageId: "message-1" });
++		expect(outcomes).toEqual(["answered"]);
++		expect(steer.delivered).toBe(true);
++
++		await steer.finish(false);
++		expect(outcomes).toEqual(["answered"]);
++	});
++
++	it("keeps one message unconfirmed at a time", async () => {
++		const { source, outcomes } = steeringSource([[user("first")], [user("second")]]);
++		const sent: string[] = [];
++		const steer = new CursorSteerInjector(source, text => {
++			sent.push(text);
++			return `message-${sent.length}`;
++		});
++
++		await steer.afterExec();
++		await steer.afterExec();
++		expect(sent).toEqual(["first"]);
++
++		steer.onAppended({ messageId: "message-1" });
++		await steer.afterExec();
++		expect(sent).toEqual(["first", "second"]);
++		expect(outcomes).toEqual(["answered", undefined]);
++	});
++
++	it("returns input to the caller when the run cannot take it", async () => {
++		const { source, outcomes } = steeringSource([[user("use tabs")]]);
++		const steer = new CursorSteerInjector(source, () => {
++			throw new Error("Cursor run ended");
++		});
++
++		await steer.afterExec();
++
++		expect(outcomes).toEqual(["rejected"]);
++		expect(steer.delivered).toBe(false);
++	});
++
++	it("returns unconfirmed input when the run ends, and stops claiming", async () => {
++		const { source, outcomes, claimOptions } = steeringSource([[user("use tabs")], [user("later")]]);
++		const steer = new CursorSteerInjector(source, () => "message-1");
++
++		await steer.afterExec();
++		await steer.finish(false);
++		await steer.afterExec();
++
++		expect(outcomes).toEqual(["rejected"]);
++		expect(claimOptions).toHaveLength(1);
++		expect(CursorSteerInjector.available).toBe(true);
++	});
++
++	// Last: the switch it flips stays off for the rest of the process.
++	it("turns injection off for the process after a run fails with input unconfirmed", async () => {
++		const failed = steeringSource([[user("use tabs")]]);
++		const steer = new CursorSteerInjector(failed.source, () => "message-1");
++		await steer.afterExec();
++		await steer.finish(true);
++
++		expect(failed.outcomes).toEqual(["rejected"]);
++		expect(CursorSteerInjector.available).toBe(false);
++
++		const next = steeringSource([[user("later")]]);
++		await new CursorSteerInjector(next.source, () => "message-2").afterExec();
++		expect(next.claimOptions).toHaveLength(0);
++	});
++});
+diff --git a/packages/ai/test/cursor-terminal-error.test.ts b/packages/ai/test/cursor-terminal-error.test.ts
+index 405ef67764b65d0c236c0bcde748b87cfd97657c..83f5227b146fdf8fc130bf4c7806b9c89c4fcd88 100644
+--- a/packages/ai/test/cursor-terminal-error.test.ts
++++ b/packages/ai/test/cursor-terminal-error.test.ts
+@@ -6,6 +6,10 @@ import type { Context, CursorToolResultHandler, Model, ToolResultMessage } from
+ import { buildModel } from "@oh-my-pi/pi-catalog/build";
+ import {
+ 	AgentServerMessageSchema,
++	AskQuestionArgs_OptionSchema,
++	AskQuestionArgs_QuestionSchema,
++	AskQuestionArgsSchema,
++	AskQuestionInteractionQuerySchema,
+ 	ConversationStateStructureSchema,
+ 	ExecServerMessageSchema,
+ 	CustomErrorDetailsSchema,
+@@ -13,6 +17,7 @@ import {
+ 	ErrorDetailsSchema,
+ 	GetBlobArgsSchema,
+ 	HeartbeatUpdateSchema,
++	InteractionQuerySchema,
+ 	InteractionUpdateSchema,
+ 	KvServerMessageSchema,
+ 	McpArgsSchema,
+@@ -52,6 +57,8 @@ type Scenario =
+ 	| { kind: "exec-in-final-chunk"; responseFinished: PromiseWithResolvers<void> }
+ 	| { kind: "exec-then-transport-error"; responseFinished: PromiseWithResolvers<void> }
+ 	| { kind: "exec-then-hang" }
++	| { kind: "question-then-transport-error" }
++	| { kind: "question-then-clean-end" }
+ 	| { kind: "todo-start-then-death" };
+ 
+ let server: http2.Http2Server | undefined;
+@@ -231,6 +238,34 @@ function execRequestFrame(): Buffer {
+ 	return frameConnectMessage(toBinary(AgentServerMessageSchema, message));
+ }
+ 
++/** A native `AskQuestion` the user has not answered yet. */
++function askQuestionFrame(): Buffer {
++	const message = create(AgentServerMessageSchema, {
++		message: {
++			case: "interactionQuery",
++			value: create(InteractionQuerySchema, {
++				id: 7,
++				query: {
++					case: "askQuestionInteractionQuery",
++					value: create(AskQuestionInteractionQuerySchema, {
++						toolCallId: "call-ask",
++						args: create(AskQuestionArgsSchema, {
++							questions: [
++								create(AskQuestionArgs_QuestionSchema, {
++									id: "db",
++									prompt: "Database?",
++									options: [create(AskQuestionArgs_OptionSchema, { id: "pg", label: "Postgres" })],
++								}),
++							],
++						}),
++					}),
++				},
++			}),
++		},
++	});
++	return frameConnectMessage(toBinary(AgentServerMessageSchema, message));
++}
++
+ /**
+  * Exec request + `turnEnded` in one chunk: the clean-completion race. Without a
+  * barrier before `done`, the Agent drains its Cursor result buffer first and
+@@ -350,6 +385,20 @@ async function startServer(): Promise<string> {
+ 			return;
+ 		}
+ 
++		if (scenario.kind === "question-then-transport-error") {
++			stream.write(
++				Buffer.concat([askQuestionFrame(), connectEndErrorFrame("unavailable", "transport died mid-question")]),
++			);
++			stream.end();
++			return;
++		}
++
++		if (scenario.kind === "question-then-clean-end") {
++			stream.write(Buffer.concat([askQuestionFrame(), turnEndedFrame()]));
++			stream.end();
++			return;
++		}
++
+ 		if (scenario.kind === "cut-after-step-completed") {
+ 			// Captured from live Cursor turns: the answer and `stepCompleted`
+ 			// arrive, then the stream closes partway through the trailing repeat
+@@ -924,6 +973,98 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
+ 		expect(paired).toEqual(["call-final"]);
+ 	});
+ 
++	it("cancels an open question when the transport fails", async () => {
++		// A question waits on the user, and the failure path drains every
++		// in-flight handler before surfacing the error; without cancellation the
++		// dialog stays open and the dead turn never reports its error.
++		scenario = { kind: "question-then-transport-error" };
++		const baseUrl = await startServer();
++		let questionSignal: AbortSignal | undefined;
++		const stream = streamCursor(makeModel(baseUrl), context, {
++			apiKey: "test-token",
++			execHandlers: {
++				async askQuestion(call) {
++					questionSignal = call.signal;
++					const { promise, resolve } = Promise.withResolvers<void>();
++					call.signal?.addEventListener("abort", () => resolve(), { once: true });
++					await promise;
++					return {
++						toolResult: {
++							role: "toolResult",
++							toolCallId: call.toolCallId,
++							toolName: "ask",
++							content: [{ type: "text", text: "Question was cancelled" }],
++							isError: true,
++							timestamp: 1,
++						},
++					};
++				},
++			},
++		});
++
++		const eventTypes: string[] = [];
++		for await (const event of stream) {
++			eventTypes.push(event.type);
++		}
++		const result = await stream.result();
++
++		expect(questionSignal?.aborted).toBe(true);
++		expect(eventTypes.at(-1)).toBe("error");
++		expect(result.errorMessage).toContain("transport died mid-question");
++	});
++
++	it("cancels an open question when the stream ends cleanly", async () => {
++		// No request signal: before the fix nothing ever aborted the dialog, and
++		// the success path's drain waited on it forever.
++		scenario = { kind: "question-then-clean-end" };
++		const baseUrl = await startServer();
++		const release = Promise.withResolvers<void>();
++		const paired: ToolResultMessage[] = [];
++		const stream = streamCursor(makeModel(baseUrl), context, {
++			apiKey: "test-token",
++			execHandlers: {
++				async askQuestion(call) {
++					call.signal?.addEventListener("abort", () => release.resolve(), { once: true });
++					await release.promise;
++					return {
++						toolResult: {
++							role: "toolResult",
++							toolCallId: call.toolCallId,
++							toolName: "ask",
++							content: [{ type: "text", text: "late dialog result" }],
++							isError: true,
++							timestamp: 1,
++						},
++					};
++				},
++			},
++			onToolResult: result => {
++				paired.push(result);
++				return result;
++			},
++		});
++
++		const hung = Symbol("hung");
++		const timer = Bun.sleep(2000).then(() => hung);
++		try {
++			const outcome = await Promise.race([stream.result(), timer]);
++			expect(outcome).not.toBe(hung);
++		} finally {
++			release.resolve();
++		}
++		const result = await stream.result();
++
++		expect(result.stopReason).not.toBe("error");
++		expect(paired).toMatchObject([
++			{
++				toolCallId: "call-ask",
++				toolName: "ask",
++				isError: true,
++				content: [{ type: "text", text: "Question was cancelled" }],
++			},
++		]);
++	});
++
+ 	it("does not hold the abort hostage to a hung exec handler", async () => {
+ 		// Exec handlers have no cancellation contract — the coding-agent bridge
+ 		// invokes `tool.execute` with no signal — so a hung or long-running tool
+diff --git a/packages/ai/test/glyph-codec.test.ts b/packages/ai/test/glyph-codec.test.ts
+index de6bf8d3cf183cc34ca105a8287a5218de9046ff..4f3e0ce98500f2f3bc3428e9ef97d51188ff4faa 100644
+--- a/packages/ai/test/glyph-codec.test.ts
++++ b/packages/ai/test/glyph-codec.test.ts
+@@ -2,7 +2,14 @@ import { afterEach, describe, expect, it } from "bun:test";
+ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+ import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+ import { streamSimple } from "@oh-my-pi/pi-ai/stream";
+-import type { AssistantMessage, Context, CursorExecHandlers, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
++import type {
++	AssistantMessage,
++	Context,
++	CursorExecHandlers,
++	CursorMcpCall,
++	ToolCall,
++	ToolResultMessage,
++} from "@oh-my-pi/pi-ai/types";
+ import { getStreamingPartialJson, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+ import { applyGlyphCodec, decodeGlyphText, encodeGlyphText } from "@oh-my-pi/pi-ai/utils/glyph-codec";
+@@ -306,6 +313,70 @@ describe("glyph stream decode", () => {
+ 		if (!("role" in result) || result.role !== "toolResult") throw new Error("expected encoded tool result");
+ 		expect(result.content[0]).toEqual({ type: "text", text: "new ⟦Uf0000⟧" });
+ 	});
++
++	it("shows AskQuestion glyphs decoded and returns form values in Cursor's encoded labels", async () => {
++		const glyph = "\ue0a0";
++		const codec = applyGlyphCodec({ messages: [{ role: "user", content: glyph, timestamp: 1 }] });
++		let shown: unknown;
++		const handlers: CursorExecHandlers = {
++			async askQuestion(call) {
++				shown = call.args;
++				return {
++					toolResult: {
++						role: "toolResult",
++						toolCallId: call.toolCallId,
++						toolName: "ask",
++						content: [{ type: "text", text: "answered" }],
++						isError: false,
++						timestamp: 0,
++					},
++					data: { icon: glyph, extras: [glyph, `${glyph} too`] },
++				};
++			},
++		};
++		const wrapped = codec.wrapCursorExecHandlers(handlers);
++		if (wrapped.askQuestion === undefined) throw new Error("expected wrapped askQuestion handler");
++		const result = await wrapped.askQuestion({
++			toolCallId: "tool-1",
++			args: { html: '<form><label><input type="radio" name="icon" value="⟦Ue0a0⟧"> Icon ⟦Ue0a0⟧</label></form>' },
++		});
++
++		expect(shown).toEqual({
++			html: `<form><label><input type="radio" name="icon" value="${glyph}"> Icon ${glyph}</label></form>`,
++		});
++		expect(result.data).toEqual({ icon: "⟦Ue0a0⟧", extras: ["⟦Ue0a0⟧", "⟦Ue0a0⟧ too"] });
++	});
++
++	it("keeps class handlers with private fields callable through the wrapper", async () => {
++		class PrivateStateHandlers implements CursorExecHandlers {
++			#prefix = "via private field";
++			async mcp(call: CursorMcpCall): Promise<ToolResultMessage> {
++				return {
++					role: "toolResult",
++					toolCallId: call.toolCallId,
++					toolName: "ask",
++					content: [{ type: "text", text: this.#prefix }],
++					isError: false,
++					timestamp: 0,
++				};
++			}
++		}
++		const codec = applyGlyphCodec({ messages: [{ role: "user", content: "\ue0a0", timestamp: 1 }] });
++		const wrapped = codec.wrapCursorExecHandlers(new PrivateStateHandlers());
++		const mcp = wrapped.mcp?.bind(wrapped);
++		if (mcp === undefined) throw new Error("expected wrapped mcp handler");
++
++		const result = await mcp({
++			name: "ask",
++			toolName: "ask",
++			providerIdentifier: "omp",
++			toolCallId: "tool-1",
++			args: {},
++			rawArgs: {},
++		});
++
++		expect(result).toMatchObject({ content: [{ type: "text", text: "via private field" }] });
++	});
+ });
+ describe("streamSimple glyph boundary", () => {
+ 	it("leaves mock requests and responses untouched", async () => {
+diff --git a/packages/catalog/CHANGELOG.md b/packages/catalog/CHANGELOG.md
+index 9eebb63f1aeef612e4f02f4ede920d4835360eb4..24abf5d571acdb006fed2b869e049efb7620d091 100644
+--- a/packages/catalog/CHANGELOG.md
++++ b/packages/catalog/CHANGELOG.md
+@@ -2,8 +2,17 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Added `freeformText` to the generated Cursor `AskQuestionSuccess_Answer`, carrying typed "Other" answers ([#16497](https://github.com/can1357/oh-my-pi/pull/16497) by [@morali](https://github.com/morali))
++
++- Added the Cursor proto fields for video attachments and host-run subagents: `SelectedVideo` and `SelectedContext.selected_videos`, `SubagentArgs.model_id` and `selected_context`, `RequestContextEnv.artifacts_folder`, `CustomSubagent.force_default_model`
++
+ ### Fixed
+ 
++- Fixed `gen:proto` failing with "Requested protobuf message … was not found" when source imports a Cursor enum by value
++- Fixed Cursor hiding models that AvailableModels serves but GetUsableModels omits (GLM 5.3, Grok 4.7) ([#18248](https://github.com/can1357/oh-my-pi/pull/18248) by [@joseotaviorf](https://github.com/joseotaviorf))
++- Fixed Cursor hiding Fable 5, 5.1 and 5.2: models Cursor flags as requiring data retention are listed, since Cursor serves them with ghost mode on
+ - Morph (`api.morphllm.com`) requests now send `x-session-id`, keeping a conversation on the worker that holds its prompt cache ([#18704](https://github.com/can1357/oh-my-pi/pull/18704) by [@wolfiesch](https://github.com/wolfiesch))
+ 
+ ## [18.18.6] - 2026-11-09
+diff --git a/packages/catalog/scripts/proto-parser.ts b/packages/catalog/scripts/proto-parser.ts
+index b23ec027e90f82b365b7117e2740c85736d4e63e..3802da367a7b185246c7139bffb3019ecc2a2990 100644
+--- a/packages/catalog/scripts/proto-parser.ts
++++ b/packages/catalog/scripts/proto-parser.ts
+@@ -1341,9 +1341,15 @@ export function generateProtoTs(
+ 			const match =
+ 				allMessages.find(m => m.fullName === spec) ||
+ 				allMessages.find(m => ctx.getEmittedName(m) === spec || m.name === spec);
+-			if (!match) throw new Error(`Requested protobuf message '${spec}' was not found`);
+-			neededMsgFullNames.add(match.fullName);
+-			queue.push(match);
++			if (match) {
++				neededMsgFullNames.add(match.fullName);
++				queue.push(match);
++				continue;
++			}
++			// Source imports enums by value too (e.g. `SubagentBackgroundReason.USER_REQUEST`).
++			const enumMatch = allEnums.find(e => e.fullName === spec || e.name === spec);
++			if (!enumMatch) throw new Error(`Requested protobuf message '${spec}' was not found`);
++			neededEnumFullNames.add(enumMatch.fullName);
+ 		}
+ 
+ 		if (options.includeDependencies ?? true) {
+diff --git a/packages/catalog/src/discovery/cursor-proto.ts b/packages/catalog/src/discovery/cursor-proto.ts
+index ef515e358b11613738749f21d13e6201e6e1e144..7ea70497186600e26fd35b406c6b8cae288b3c76 100644
+--- a/packages/catalog/src/discovery/cursor-proto.ts
++++ b/packages/catalog/src/discovery/cursor-proto.ts
+@@ -91,6 +91,13 @@ export enum CursorRuleSource {
+ 	USER = 2,
+ }
+ 
++/** Cursor agent enum CustomSubagentPermissionMode. */
++export enum CustomSubagentPermissionMode {
++	UNSPECIFIED = 0,
++	DEFAULT = 1,
++	READONLY = 2,
++}
++
+ /** Cursor agent enum DegradationStatus. */
+ export enum DegradationStatus {
+ 	UNSPECIFIED = 0,
+@@ -610,11 +617,13 @@ export const AskQuestionSuccessSchema: MessageCodec<AskQuestionSuccess> = pb<Ask
+ export interface AskQuestionSuccess_Answer extends ProtoMessage {
+ 	questionId: string;
+ 	selectedOptionIds: string[];
++	freeformText: string;
+ }
+ 
+ export const AskQuestionSuccess_AnswerSchema: MessageCodec<AskQuestionSuccess_Answer> = pb<AskQuestionSuccess_Answer>("agent.v1.AskQuestionSuccess_Answer", [
+ 	{ no: 1, name: "questionId", kind: "string" },
+ 	{ no: 2, name: "selectedOptionIds", kind: "string", repeat: true },
++	{ no: 3, name: "freeformText", kind: "string" },
+ ]);
+ 
+ /** Cursor agent message agent.v1.AskQuestionToolCall. */
+@@ -1781,6 +1790,7 @@ export interface CustomSubagent extends ProtoMessage {
+ 	model: string;
+ 	prompt: string;
+ 	permissionMode: number;
++	forceDefaultModel: boolean;
+ }
+ 
+ export const CustomSubagentSchema: MessageCodec<CustomSubagent> = pb<CustomSubagent>("agent.v1.CustomSubagent", [
+@@ -1791,6 +1801,7 @@ export const CustomSubagentSchema: MessageCodec<CustomSubagent> = pb<CustomSubag
+ 	{ no: 5, name: "model", kind: "string" },
+ 	{ no: 6, name: "prompt", kind: "string" },
+ 	{ no: 7, name: "permissionMode", kind: "int32" },
++	{ no: 13, name: "forceDefaultModel", kind: "bool" },
+ ]);
+ 
+ /** Cursor agent message agent.v1.DebugModeConfig. */
+@@ -6018,6 +6029,7 @@ export interface RequestContextEnv extends ProtoMessage {
+ 	timeZone: string;
+ 	projectFolder: string;
+ 	agentTranscriptsFolder: string;
++	artifactsFolder?: string;
+ }
+ 
+ export const RequestContextEnvSchema: MessageCodec<RequestContextEnv> = pb<RequestContextEnv>("agent.v1.RequestContextEnv", [
+@@ -6031,6 +6043,7 @@ export const RequestContextEnvSchema: MessageCodec<RequestContextEnv> = pb<Reque
+ 	{ no: 10, name: "timeZone", kind: "string" },
+ 	{ no: 11, name: "projectFolder", kind: "string" },
+ 	{ no: 12, name: "agentTranscriptsFolder", kind: "string" },
++	{ no: 13, name: "artifactsFolder", kind: "string", optional: true },
+ ]);
+ 
+ /** Cursor agent message agent.v1.RequestContextError. */
+@@ -6244,6 +6257,7 @@ export interface SelectedContext extends ProtoMessage {
+ 	gitPrDiffSelections: SelectedGitPRDiffSelection[];
+ 	selectedPullRequests: SelectedPullRequest[];
+ 	selectedSubagents: SelectedSubagent[];
++	selectedVideos: SelectedVideo[];
+ }
+ 
+ export const SelectedContextSchema: MessageCodec<SelectedContext> = pb<SelectedContext>("agent.v1.SelectedContext", [
+@@ -6269,6 +6283,7 @@ export const SelectedContextSchema: MessageCodec<SelectedContext> = pb<SelectedC
+ 	{ no: 20, name: "gitPrDiffSelections", kind: "message", T: () => SelectedGitPRDiffSelectionSchema, repeat: true },
+ 	{ no: 21, name: "selectedPullRequests", kind: "message", T: () => SelectedPullRequestSchema, repeat: true },
+ 	{ no: 22, name: "selectedSubagents", kind: "message", T: () => SelectedSubagentSchema, repeat: true },
++	{ no: 23, name: "selectedVideos", kind: "message", T: () => SelectedVideoSchema, repeat: true },
+ ]);
+ 
+ /** Cursor agent message agent.v1.SelectedCursorCommand. */
+@@ -6536,6 +6551,37 @@ export const SelectedUIElementSchema: MessageCodec<SelectedUIElement> = pb<Selec
+ 	{ no: 6, name: "componentPropsJson", kind: "string", optional: true },
+ ]);
+ 
++/** Cursor agent message agent.v1.SelectedVideo. */
++export interface SelectedVideo extends ProtoMessage {
++	uuid: string;
++	path: string;
++	fps?: number;
++	mimeType: string;
++	filename: string;
++	materializeToFilesystem: boolean;
++	dataOrBlobId:
++		| { case: undefined; value?: undefined }
++		| { case: "blobId"; value: Uint8Array }
++		| { case: "data"; value: Uint8Array };
++}
++
++export const SelectedVideoSchema: MessageCodec<SelectedVideo> = pb<SelectedVideo>("agent.v1.SelectedVideo", [
++	{ no: 2, name: "uuid", kind: "string" },
++	{ no: 3, name: "path", kind: "string" },
++	{ no: 4, name: "fps", kind: "float", optional: true },
++	{ no: 7, name: "mimeType", kind: "string" },
++	{ no: 10, name: "filename", kind: "string" },
++	{ no: 12, name: "materializeToFilesystem", kind: "bool" },
++	{
++		kind: "oneof",
++		name: "dataOrBlobId",
++		variants: [
++			{ no: 1, name: "blobId", kind: "bytes" },
++			{ no: 8, name: "data", kind: "bytes" },
++		],
++	},
++]);
++
+ /** Cursor agent message agent.v1.SemSearchToolArgs. */
+ export interface SemSearchToolArgs extends ProtoMessage {
+ 	query: string;
+@@ -7519,13 +7565,17 @@ export const StopRequestResponseSchema: MessageCodec<StopRequestResponse> = pb<S
+ export interface SubagentArgs extends ProtoMessage {
+ 	toolCallId: string;
+ 	subagentType: string;
++	modelId: string;
+ 	prompt: string;
++	selectedContext?: SelectedContext;
+ }
+ 
+ export const SubagentArgsSchema: MessageCodec<SubagentArgs> = pb<SubagentArgs>("agent.v1.SubagentArgs", [
+ 	{ no: 1, name: "toolCallId", kind: "string" },
+ 	{ no: 2, name: "subagentType", kind: "string" },
++	{ no: 3, name: "modelId", kind: "string" },
+ 	{ no: 4, name: "prompt", kind: "string" },
++	{ no: 17, name: "selectedContext", kind: "message", T: () => SelectedContextSchema },
+ ]);
+ 
+ /** Cursor agent message agent.v1.SubagentAwaitArgs. */
+diff --git a/packages/catalog/src/discovery/cursor.ts b/packages/catalog/src/discovery/cursor.ts
+index abae947e5497e5b97bc4f4e915cd6b16b69e5689..66e5d065a24194c0d32104de32fc05eb3988b78c 100644
+--- a/packages/catalog/src/discovery/cursor.ts
++++ b/packages/catalog/src/discovery/cursor.ts
+@@ -89,9 +89,12 @@ export interface CursorModelDiscoveryOptions {
+ 
+ /**
+  * Joins Cursor's account-scoped model RPCs:
+- * - `AvailableModels` supplies rich base models, parameter axes, variants,
+- *   capabilities, aliases, and cost-multiplier metadata.
+- * - `GetUsableModels` supplies the exact legacy wire slugs the account can run.
++ * - `AvailableModels` is the account's authoritative roster: rich base models,
++ *   parameter axes, variants, capabilities, aliases and cost multipliers.
++ *   cursor-agent runs every model it lists, including ones `GetUsableModels`
++ *   omits.
++ * - `GetUsableModels` is the fallback roster when `AvailableModels` fails. It
++ *   also contributes usable slugs the rich roster does not describe.
+  * - `GetDefaultModelForCli` identifies the account's current default.
+  *
+  * Per-token rates come from the reviewed `providers/cursor.kdl` rate card and
+@@ -152,11 +155,9 @@ export async function fetchCursorUsableModels(
+ 		parsedUsable instanceof type.errors
+ 			? []
+ 			: normalizeCursorModels(parsedUsable.models, options.baseUrl, references);
+-	const usableModelIds = usable === null ? undefined : new Set(legacyModels.map(model => model.id));
+ 	if (!available || available.models.length === 0) return legacyModels;
+ 	const richModels = normalizeRichCursorModels(
+ 		available.models,
+-		usableModelIds,
+ 		options.baseUrl,
+ 		references,
+ 		defaultModel?.modelId,
+@@ -541,7 +542,6 @@ function resolveCursorCardAxes(slug: string): { patch?: ModelCost; fallback?: Mo
+ 
+ function normalizeRichCursorModels(
+ 	models: readonly AvailableModelsResponse_ModelDetails[],
+-	usableModelIds: ReadonlySet<string> | undefined,
+ 	baseUrlOverride: string | undefined,
+ 	references: Map<string, ModelSpec<"cursor-agent">>,
+ 	defaultModelId: string | undefined,
+@@ -551,11 +551,8 @@ function normalizeRichCursorModels(
+ 	for (const details of models) {
+ 		const baseId = details.name.trim();
+ 		if (!baseId || details.supportsAgent === false || details.isChatOnly === true) continue;
+-		// OMP always sends Cursor's zero-data-retention header. Advertising a
+-		// retention-required model would expose a route every invocation rejects.
+-		if (details.requiresDataRetention === true) continue;
+ 
+-		const variants = normalizeRichCursorVariants(details, baseId, usableModelIds);
++		const variants = normalizeRichCursorVariants(details, baseId);
+ 		if (variants.length === 0) continue;
+ 		// The bare lane id belongs to Cursor's flagged default configuration, so
+ 		// seed axis defaults from it before falling back to first-seen values;
+@@ -615,11 +612,8 @@ function normalizeRichCursorModels(
+ function normalizeRichCursorVariants(
+ 	details: AvailableModelsResponse_ModelDetails,
+ 	baseId: string,
+-	usableModelIds: ReadonlySet<string> | undefined,
+ ): NormalizedRichVariant[] {
+ 	if (details.variants.length === 0) {
+-		const candidates = [baseId, ...details.legacySlugs, ...details.idAliases];
+-		if (usableModelIds !== undefined && !candidates.some(id => usableModelIds.has(id))) return [];
+ 		return [{ id: baseId, parameters: [], variant: undefined, effort: undefined }];
+ 	}
+ 
+@@ -635,10 +629,6 @@ function normalizeRichCursorVariants(
+ 			variant.legacySlug?.trim() ||
+ 			variant.variantStringRepresentation?.trim() ||
+ 			(parameterSuffix ? `${baseId}@${parameterSuffix}` : `${baseId}@variant-${index + 1}`);
+-		const entitlementIds = [variant.legacySlug?.trim(), id, baseId, ...details.idAliases].filter(
+-			(candidate): candidate is string => Boolean(candidate),
+-		);
+-		if (usableModelIds !== undefined && !entitlementIds.some(candidate => usableModelIds.has(candidate))) continue;
+ 		const routeSignature = `${parameterSuffix}\u0000${variant.isMaxMode === true ? "max" : "standard"}`;
+ 		if (seenRoutes.has(routeSignature)) continue;
+ 		seenRoutes.add(routeSignature);
+diff --git a/packages/catalog/src/provider-models/cache-provider-id.ts b/packages/catalog/src/provider-models/cache-provider-id.ts
+index b910ebc2bb9aa505b8443464cf992912116bc72e..07387841408a0efe471c23e199261f75db9c3839 100644
+--- a/packages/catalog/src/provider-models/cache-provider-id.ts
++++ b/packages/catalog/src/provider-models/cache-provider-id.ts
+@@ -123,10 +123,12 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
+ 			// from the KDL rate card; v4 keys the scope on the token's stable
+ 			// account subject instead of the rotating JWT; v5 drops rows that still
+ 			// mark the account default `isProviderDefault`, which startup now honors.
++			// v6 refetches rosters written while rich variants were gated on GetUsableModels slugs, which hid models Cursor serves (GLM 5.3, Grok 4.7).
++			// v7 refetches rosters that dropped `requires_data_retention` models (Fable 5/5.1), which Cursor serves under ghost mode.
+ 			const baseUrl = (options.baseUrl ?? CURSOR_DEFAULT_BASE_URL).replace(/\/+$/, "");
+ 			const apiKey = options.apiKey ?? "";
+ 			const scope = `${jwtCredentialSubject(apiKey) ?? apiKey}\u0000${baseUrl}`;
+-			return `cursor:rich-models-v5:${Bun.hash(scope).toString(36)}`;
++			return `cursor:rich-models-v7:${Bun.hash(scope).toString(36)}`;
+ 		}
+ 		case "charm-hyper": {
+ 			// Discovery is authoritative for this gateway, so a warm cache is served
+diff --git a/packages/catalog/test/cursor-discovery.test.ts b/packages/catalog/test/cursor-discovery.test.ts
+index 6ba447264a46dab86a26c906f715e446b85cee17..61fb2c87321f250c35792dbde823f3810e7207dc 100644
+--- a/packages/catalog/test/cursor-discovery.test.ts
++++ b/packages/catalog/test/cursor-discovery.test.ts
+@@ -284,7 +284,7 @@ function cursorModelSpec(id: string): ModelSpec<"cursor-agent"> {
+ }
+ 
+ describe("fetchCursorUsableModels", () => {
+-	it("joins rich model metadata, account defaults, routes, and ZDR eligibility", async () => {
++	it("joins rich model metadata, account defaults, and routes", async () => {
+ 		const effortValues = [
+ 			create(ModelParameterDefinition_EnumParameterDefinition_EnumParameterValueSchema, { value: "low" }),
+ 			create(ModelParameterDefinition_EnumParameterDefinition_EnumParameterValueSchema, { value: "high" }),
+@@ -342,7 +342,6 @@ describe("fetchCursorUsableModels", () => {
+ 				"claude-4.6-opus-high",
+ 				"claude-4.6-opus-max",
+ 				"claude-4.6-opus-xhigh",
+-				"fable-retention",
+ 				"legacy-only",
+ 			].map(modelId => create(ModelDetailsSchema, { modelId })),
+ 		});
+@@ -375,18 +374,11 @@ describe("fetchCursorUsableModels", () => {
+ 						variant("claude-4.6-opus-low", "low", false, true, false),
+ 						variant("claude-4.6-opus-high", "high", false, false, true),
+ 						variant("claude-4.6-opus-max", "max", true),
+-						variant("claude-4.6-opus-medium", "medium", false),
+ 						variant("claude-4.6-opus-high", "max", true),
+ 						variant("claude-4.6-opus-xhigh", "xhigh", false),
+ 						variant("claude-4.6-opus-high", "high", true, false, true, "1m"),
+ 					],
+ 				}),
+-				create(AvailableModelsResponse_ModelDetailsSchema, {
+-					name: "fable",
+-					supportsAgent: true,
+-					requiresDataRetention: true,
+-					legacySlugs: ["fable-retention"],
+-				}),
+ 			],
+ 		});
+ 		const providerDefault = create(GetDefaultModelForCliResponseSchema, {
+@@ -477,9 +469,7 @@ describe("fetchCursorUsableModels", () => {
+ 				}),
+ 			}),
+ 		);
+-		expect(models?.some(model => model.id === "claude-4.6-opus-medium")).toBe(false);
+ 		expect(models?.some(model => model.id === "claude-4.6-opus-xhigh")).toBe(false);
+-		expect(models?.some(model => model.id === "fable-retention")).toBe(false);
+ 
+ 		const collapsed = collapseBuiltVariants((models ?? []).map(model => buildModel(model)));
+ 		const rebuiltLane = collapsed.find(model => model.id === "claude-4.6-opus");
+@@ -490,6 +480,83 @@ describe("fetchCursorUsableModels", () => {
+ 		expect(rebuiltLane?.thinking?.effortRouting).toEqual(lane?.thinking?.effortRouting);
+ 	});
+ 
++	it("lists AvailableModels models that GetUsableModels omits", async () => {
++		const usable = create(GetUsableModelsResponseSchema, {
++			models: [create(ModelDetailsSchema, { modelId: "composer-2.5" })],
++		});
++		const available = create(AvailableModelsResponseSchema, {
++			models: [
++				create(AvailableModelsResponse_ModelDetailsSchema, {
++					name: "glm-5p3-flash",
++					clientDisplayName: "GLM 5.3 Flash",
++					supportsAgent: true,
++					supportsImages: true,
++					contextTokenLimit: 1_000_000,
++					legacySlugs: ["glm-5p3-flash", "glm-5p3-flash-low", "glm-5p3-flash-high", "glm-5p3-flash-max"],
++					variants: [
++						richVariant("glm-5p3-flash-low", { reasoning: "low" }),
++						richVariant("glm-5p3-flash-high", { reasoning: "high" }, { isDefaultNonMaxConfig: true }),
++						richVariant("glm-5p3-flash-max", { reasoning: "max" }),
++					],
++				}),
++			],
++		});
++		const rpcBaseUrl = await startCursorDiscoveryRpcServer({
++			"/agent.v1.AgentService/GetUsableModels": toBinary(GetUsableModelsResponseSchema, usable),
++			"/aiserver.v1.AiService/AvailableModels": toBinary(AvailableModelsResponseSchema, available),
++		});
++		const models = await fetchCursorUsableModels({
++			apiKey: "account-token",
++			baseUrl: rpcBaseUrl,
++			timeoutMs: 1_000,
++		});
++
++		const lane = models?.find(model => model.id === "glm-5p3-flash");
++		expect(lane?.requestModelId).toBe("glm-5p3-flash-high");
++		expect(lane?.cursorModelRoutes).toEqual({
++			"glm-5p3-flash-low": {
++				modelId: "glm-5p3-flash",
++				parameters: [{ id: "reasoning", value: "low" }],
++			},
++			"glm-5p3-flash-high": {
++				modelId: "glm-5p3-flash",
++				parameters: [{ id: "reasoning", value: "high" }],
++			},
++			"glm-5p3-flash-max": {
++				modelId: "glm-5p3-flash",
++				parameters: [{ id: "reasoning", value: "max" }],
++			},
++		});
++		expect(lane?.thinking?.effortRouting).toEqual({
++			low: "glm-5p3-flash-low",
++			high: "glm-5p3-flash-high",
++			max: "glm-5p3-flash-max",
++		});
++		expect(models?.some(model => model.id === "composer-2.5")).toBe(true);
++	});
++
++	it("lists models Cursor flags as requiring data retention", async () => {
++		const available = create(AvailableModelsResponseSchema, {
++			models: [
++				create(AvailableModelsResponse_ModelDetailsSchema, {
++					name: "claude-fable-5-1",
++					clientDisplayName: "Fable 5.1",
++					supportsAgent: true,
++					requiresDataRetention: true,
++					contextTokenLimit: 200_000,
++					legacySlugs: ["claude-fable-5-1-high"],
++					variants: [richVariant("claude-fable-5-1-high", { effort: "high" }, { isDefaultNonMaxConfig: true })],
++				}),
++			],
++		});
++		const rpcBaseUrl = await startCursorDiscoveryRpcServer({
++			"/aiserver.v1.AiService/AvailableModels": toBinary(AvailableModelsResponseSchema, available),
++		});
++		const models = await fetchCursorUsableModels({ apiKey: "account-token", baseUrl: rpcBaseUrl, timeoutMs: 1_000 });
++
++		expect(models?.find(model => model.id === "claude-fable-5-1")?.requestModelId).toBe("claude-fable-5-1-high");
++	});
++
+ 	it("prices rich lanes from the KDL rate card and leaves uncovered lanes unpriced", async () => {
+ 		const fastDefinition = create(ModelParameterDefinitionSchema, {
+ 			id: "fast",
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index 36e70a8d99c9bb496e297dcddfc53b93d39b3487..56ff0b2d79eb9e3a22f258a0a96bd0704993c62c 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -4,10 +4,15 @@
+ 
+ ### Added
+ 
++- Added `providers.cursorLiveSteering` (off by default): messages typed while a Cursor turn runs, and background-job results, join that turn after the next tool call instead of waiting for it to end
++- Added Cursor's `videoReview` subagent: a Cursor model hands videos to Gemini 3.1 Pro, which watches them with their sound and reports what it sees and hears. The model copies the video into the session's artifacts folder and attaches it with `Task`'s `file_attachments` (up to 5 videos, 35 MB in total)
++- `ask` results carry the submitted form data in `details.data` beside the readable `answers`, so a host reads the chosen values without parsing the result text
+ - Extensions can ask the operator before an interactive quit, or cancel it, with `session_before_shutdown`; a further `/exit` or Ctrl+D skips the pending prompts and closes ([#18424](https://github.com/can1357/oh-my-pi/pull/18424) by [@aw1cks](https://github.com/aw1cks))
+ 
+ ### Fixed
+ 
++- Fixed Cursor models failing to ask questions: their native `AskQuestion` now opens as an `ask` form instead of being rejected with "Interactive questions are not implemented by this client", one question at a time (including `ask` called over MCP), each closing when the turn is aborted. A form the timeout submits reaches Cursor as unanswered. Sessions without `ask` (subagents, headless) still reject it ([#16497](https://github.com/can1357/oh-my-pi/pull/16497) by [@morali](https://github.com/morali))
++- Fixed Cursor models failing to delegate: their native `Task` now runs an omp subagent (`explore` runs `scout`) and waits for its report instead of being rejected with "Subagents are not implemented by this client"
+ - Extension prompts shown from `session_before_*` handlers no longer time out after 30 seconds while the operator is still answering ([#18424](https://github.com/can1357/oh-my-pi/pull/18424) by [@aw1cks](https://github.com/aw1cks))
+ - A second exit request now skips pending `worktree.onExit` prompts and keeps those worktrees instead of waiting for an answer ([#18424](https://github.com/can1357/oh-my-pi/pull/18424) by [@aw1cks](https://github.com/aw1cks))
+ ### Fixed
+diff --git a/packages/coding-agent/src/cursor.ts b/packages/coding-agent/src/cursor.ts
+index 75a080fb5b451ac8fec256048faa585316bc2317..b3de7e23625d0e48479996c4157e21ae9fab2484 100644
+--- a/packages/coding-agent/src/cursor.ts
++++ b/packages/coding-agent/src/cursor.ts
+@@ -14,12 +14,22 @@ import {
+ 	validateAgentToolArguments,
+ } from "@oh-my-pi/pi-agent-core";
+ import type {
++	CursorAskFormData,
++	CursorAskQuestionCall,
++	CursorAskQuestionResult,
++	CursorAttachedVideo,
++	CursorCustomSubagent,
+ 	CursorExecFrameContext,
+ 	CursorMcpCall,
+ 	CursorMcpResource,
+ 	CursorMcpResourceContent,
+ 	CursorShellStreamCallbacks,
++	CursorSubagentAwaitCall,
++	CursorSubagentAwaitOutcome,
++	CursorSubagentCall,
++	CursorSubagentOutcome,
+ 	CursorTodoSnapshot,
++	CursorVideoAttachment,
+ 	CursorExecHandlers as ICursorExecHandlers,
+ 	ToolResultMessage,
+ } from "@oh-my-pi/pi-ai";
+@@ -36,8 +46,9 @@ import {
+ 	shellDeadlineSeconds,
+ } from "@oh-my-pi/pi-ai/providers/cursor-pi-args";
+ import { editDiffString } from "@oh-my-pi/pi-natives";
+-import { isEnoent, sanitizeText } from "@oh-my-pi/pi-utils";
++import { isEnoent, Serial, sanitizeText } from "@oh-my-pi/pi-utils";
+ import { cursorMcpPrefersReplaceEdit, normalizeCursorReplaceArgs } from "./cursor-bridge-tools";
++import cursorVideoReviewPrompt from "./prompts/system/cursor-video-review.md" with { type: "text" };
+ import { normalizeToLF, stripBom } from "./edit/normalize";
+ import type { MCPResourceReadResult } from "./mcp/types";
+ import {
+@@ -54,7 +65,10 @@ import {
+ 	resolveToCwd,
+ 	splitPathAndSelPreferringLiteral,
+ } from "./tools/path-utils";
++import type { AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
+ import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
++import type { TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
++import type { AsyncJobManagerApi } from "./async/job-manager";
+ import type { TodoPhase, TodoStatus } from "@oh-my-pi/pi-tui/tools/todo";
+ 
+ /** Phase used for Cursor-owned tasks with no local phase grouping. */
+@@ -101,6 +115,8 @@ interface CursorExecBridgeOptions {
+ 	getEditReplaceTool?: () => CursorBridgeTool | undefined;
+ 	getToolContext?: () => AgentToolContext | undefined;
+ 	emitEvent?: (event: AgentEvent) => void;
++	/** Jobs a backgrounded native `Task` runs as; without it `subagentAwait` finds none. */
++	asyncJobManager?: AsyncJobManagerApi;
+ 	/**
+ 	 * Whether frames that mutate the filesystem WITHOUT running a registry tool
+ 	 * may do so: the native `delete` frame, and a `read_mcp_resource` carrying
+@@ -159,6 +175,87 @@ interface CursorExecBridgeOptions {
+ 	 * which is indistinguishable from a server that advertises nothing.
+ 	 */
+ 	mcpResources?: CursorMcpResourceAdapter;
++	/**
++	 * Run Cursor's `videoReview` subagent: a video model reads the videos and
++	 * answers the prompt; the returned text is the subagent's report. Without
++	 * it, or without {@link getArtifactsDir}, the type is not advertised and
++	 * Cursor refuses it.
++	 */
++	reviewVideos?: (request: CursorVideoReviewRequest) => Promise<string>;
++	/** The session's artifacts directory: Cursor lets `Task` attach files from under it. */
++	getArtifactsDir?: () => string | undefined;
++}
++
++/** One `videoReview` run: {@link CursorExecBridgeOptions.reviewVideos} sends it to the video model. */
++export interface CursorVideoReviewRequest {
++	modelId: string;
++	systemPrompt: string;
++	prompt: string;
++	videos: CursorVideoAttachment[];
++	signal?: AbortSignal;
++}
++
++const VIDEO_REVIEW_SUBAGENT = "videoReview";
++/** The model Cursor's own `videoReview` runs on. */
++const VIDEO_REVIEW_MODEL = "gemini-3.1-pro";
++/** Cursor's limits for the videos a subagent reads inline. */
++const MAX_REVIEW_VIDEOS = 5;
++const MAX_REVIEW_VIDEO_BYTES = 35 * 1024 * 1024;
++
++/** The videos Cursor attached to a `videoReview` call, read within Cursor's count and size limits. */
++async function readReviewVideos(attached: readonly CursorAttachedVideo[]): Promise<CursorVideoAttachment[]> {
++	const videos = attached.filter(video => video.mimeType.startsWith("video/"));
++	if (videos.length === 0) {
++		throw new Error(`${VIDEO_REVIEW_SUBAGENT} needs at least one video in file_attachments`);
++	}
++	if (videos.length > MAX_REVIEW_VIDEOS) {
++		throw new Error(`${VIDEO_REVIEW_SUBAGENT} takes at most ${MAX_REVIEW_VIDEOS} videos`);
++	}
++	const sizes = await Promise.all(videos.map(async video => (await fs.promises.stat(video.path)).size));
++	if (sizes.reduce((total, size) => total + size, 0) > MAX_REVIEW_VIDEO_BYTES) {
++		throw new Error(`Videos exceed ${MAX_REVIEW_VIDEO_BYTES / 1024 / 1024} MB in total`);
++	}
++	return await Promise.all(videos.map(async video => ({ ...video, data: await Bun.file(video.path).bytes() })));
++}
++
++/**
++ * `videoReview`: the video model's answer is the subagent's report. A module
++ * function, not a `#private` method: the glyph codec calls handlers with its
++ * Proxy as `this`.
++ */
++async function reviewCursorVideos(
++	options: CursorExecBridgeOptions,
++	call: CursorSubagentCall,
++	reviewVideos: NonNullable<CursorExecBridgeOptions["reviewVideos"]>,
++): Promise<CursorSubagentOutcome> {
++	const { toolCallId } = call;
++	options.emitEvent?.({
++		type: "tool_execution_start",
++		toolCallId,
++		toolName: "task",
++		args: { agent: VIDEO_REVIEW_SUBAGENT, task: call.prompt },
++	});
++	let result: AgentToolResult<unknown>;
++	let report: string | undefined;
++	try {
++		report = await reviewVideos({
++			modelId: call.modelId ?? VIDEO_REVIEW_MODEL,
++			systemPrompt: cursorVideoReviewPrompt,
++			prompt: call.prompt,
++			videos: await readReviewVideos(call.videos ?? []),
++			signal: call.signal,
++		});
++		result = { content: [{ type: "text", text: report }], details: undefined };
++	} catch (error) {
++		result = buildToolErrorResult(error instanceof Error ? error.message : String(error));
++	}
++	const isError = report === undefined;
++	options.emitEvent?.({ type: "tool_execution_end", toolCallId, toolName: "task", result, isError });
++	return {
++		toolResult: createToolResultMessage(toolCallId, "task", result, isError),
++		finalMessage: report,
++		background: false,
++	};
+ }
+ 
+ /**
+@@ -306,6 +403,7 @@ async function executeTool(
+ 	toolCallId: string,
+ 	args: Record<string, unknown>,
+ 	overrideTool?: CursorBridgeTool,
++	signal?: AbortSignal,
+ ): Promise<ToolResultMessage> {
+ 	const tool = overrideTool ?? options.getExecutableTool?.(toolName) ?? options.tools.get(toolName);
+ 	if (!tool) {
+@@ -345,7 +443,7 @@ async function executeTool(
+ 			name: toolName,
+ 			arguments: toolArgs,
+ 		});
+-		result = await tool.execute(toolCallId, validatedArgs, undefined, onUpdate, bridgeContext.context);
++		result = await tool.execute(toolCallId, validatedArgs, signal, onUpdate, bridgeContext.context);
+ 	} catch (error) {
+ 		const message = error instanceof Error ? error.message : String(error);
+ 		result = buildToolErrorResult(message);
+@@ -542,6 +640,15 @@ function decodeToolCallId(toolCallId?: string): string {
+ 	return toolCallId && toolCallId.length > 0 ? toolCallId : randomUUID();
+ }
+ 
++/**
++ * The form data the user submitted. A timeout submits the form's current
++ * values, not the user's choice: Cursor gets it as a rejection carrying
++ * `ask`'s own explanation.
++ */
++function cursorAskFormData(details: AskToolDetails | undefined): CursorAskFormData | undefined {
++	return details?.timedOut ? undefined : details?.data;
++}
++
+ function decodeMcpArgs(rawArgs: Record<string, Uint8Array>): Record<string, unknown> {
+ 	const decoded: Record<string, unknown> = {};
+ 	for (const [key, value] of Object.entries(rawArgs)) {
+@@ -631,6 +738,9 @@ function buildTodoSyncResult(
+ }
+ 
+ export class CursorExecHandlers implements ICursorExecHandlers {
++	/** `ask` owns one shared dialog; overlapping Cursor questions would clobber each other. */
++	#askSerial = new Serial();
++
+ 	constructor(private options: CursorExecBridgeOptions) {}
+ 
+ 	/**
+@@ -1163,6 +1273,137 @@ export class CursorExecHandlers implements ICursorExecHandlers {
+ 		return result;
+ 	}
+ 
++	/**
++	 * Cursor's native `AskQuestion`. Sessions without `ask` (subagents, headless)
++	 * answer with an error result, which the provider sends as a rejection.
++	 */
++	async askQuestion(call: CursorAskQuestionCall): Promise<CursorAskQuestionResult> {
++		const toolResult = await this.#runAsk("ask", call.toolCallId, call.args, call.signal);
++		return { toolResult, data: cursorAskFormData(toolResult.details as AskToolDetails | undefined) };
++	}
++
++	/** Native and MCP questions share the queue; one whose turn was aborted while it waited is not shown. */
++	#runAsk(
++		toolName: string,
++		toolCallId: string,
++		args: Record<string, unknown>,
++		signal: AbortSignal | undefined,
++	): Promise<ToolResultMessage> {
++		return this.#askSerial.run(async () => {
++			if (signal?.aborted) {
++				const result = buildToolErrorResult("Question was cancelled before it was shown");
++				return createToolResultMessage(toolCallId, toolName, result, true);
++			}
++			return await executeTool(this.options, toolName, toolCallId, args, undefined, signal);
++		});
++	}
++
++	/** Folder Cursor lets `Task` attach files from; set only while `videoReview` can run. */
++	artifactsFolder(): string | undefined {
++		return this.options.reviewVideos ? this.options.getArtifactsDir?.() : undefined;
++	}
++
++	/** `videoReview`, advertised once there is a folder its videos can come from. */
++	customSubagents(): CursorCustomSubagent[] {
++		const folder = this.artifactsFolder();
++		if (!folder) return [];
++		return [
++			{
++				name: VIDEO_REVIEW_SUBAGENT,
++				description:
++					`Watch videos with a video model (${VIDEO_REVIEW_MODEL}) and answer questions about them: picture, on-screen text, speech, music and sound. ` +
++					`Pass the video files in file_attachments: up to ${MAX_REVIEW_VIDEOS} videos, ${MAX_REVIEW_VIDEO_BYTES / 1024 / 1024} MB in total. ` +
++					`Cursor accepts only files under ${folder}, so copy or download the user's video there first (create the folder if missing). ` +
++					"Say in the prompt what to look or listen for.",
++				model: VIDEO_REVIEW_MODEL,
++				prompt: cursorVideoReviewPrompt,
++				readonly: true,
++				forceDefaultModel: true,
++			},
++		];
++	}
++
++	/**
++	 * Cursor's native `Task`, run on the session's `task` tool. Cursor's
++	 * `explore` maps to the read-only `scout`; `videoReview` goes to the video
++	 * model; every other type runs the session's default agent.
++	 *
++	 * Cursor models treat `Task` as blocking and end the turn when it returns
++	 * without a report, so a spawn `async.enabled` backgrounded is awaited here.
++	 * Concurrent `Task` frames still run in parallel. A spawn still running when
++	 * the call is aborted stays a background job that {@link subagentAwait} reads.
++	 */
++	async subagent(call: CursorSubagentCall): Promise<CursorSubagentOutcome> {
++		const reviewVideos = this.options.reviewVideos;
++		if (reviewVideos && call.subagentType === VIDEO_REVIEW_SUBAGENT) {
++			return await reviewCursorVideos(this.options, call, reviewVideos);
++		}
++		const toolResult = await executeTool(
++			this.options,
++			"task",
++			call.toolCallId,
++			{ agent: call.subagentType === "explore" ? "scout" : undefined, task: call.prompt },
++			undefined,
++			call.signal,
++		);
++		const jobId = (toolResult.details as TaskToolDetails | undefined)?.async?.jobId;
++		if (jobId !== undefined) {
++			const outcome = await this.subagentAwait({
++				agentId: jobId,
++				timeoutMs: Number.POSITIVE_INFINITY,
++				signal: call.signal,
++			});
++			switch (outcome.status) {
++				case "complete":
++					return {
++						toolResult: { ...toolResult, content: [{ type: "text", text: outcome.finalMessage ?? "" }] },
++						agentId: jobId,
++						finalMessage: outcome.finalMessage,
++						background: false,
++					};
++				case "running":
++					return { toolResult, agentId: jobId, background: true };
++				case "error":
++					return {
++						toolResult: { ...toolResult, content: [{ type: "text", text: outcome.error }], isError: true },
++						agentId: jobId,
++						background: false,
++					};
++			}
++		}
++		const text = toolResult.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
++		return { toolResult, finalMessage: toolResult.isError ? undefined : text, background: false };
++	}
++
++	async subagentAwait({ agentId, timeoutMs, signal }: CursorSubagentAwaitCall): Promise<CursorSubagentAwaitOutcome> {
++		const manager = this.options.asyncJobManager;
++		const job = manager?.getJob(agentId);
++		if (!manager || !job || job.type !== "task") return { status: "notFound" };
++		if (job.status === "running" && timeoutMs > 0) {
++			const { promise: stop, resolve } = Promise.withResolvers<void>();
++			// Timers fire at once past 2^31-1 ms; anything that long waits for the job.
++			const timer = timeoutMs < 2 ** 31 ? setTimeout(resolve, timeoutMs) : undefined;
++			signal?.addEventListener("abort", () => resolve(), { once: true });
++			try {
++				await Promise.race([job.promise, stop]);
++			} finally {
++				clearTimeout(timer);
++			}
++		}
++		switch (job.status) {
++			case "running":
++				return { status: "running" };
++			case "completed":
++				// Cursor now holds the report; a second delivery as a follow-up turn would repeat it.
++				manager.consumeJobResults([agentId]);
++				return { status: "complete", finalMessage: job.resultText };
++			case "failed":
++				manager.consumeJobResults([agentId]);
++				return { status: "error", error: job.errorText ?? "Subagent failed" };
++		}
++		return { status: "error", error: "Subagent was cancelled" };
++	}
++
+ 	async mcp(call: CursorMcpCall) {
+ 		const toolName = call.toolName || call.name;
+ 		const toolCallId = decodeToolCallId(call.toolCallId);
+@@ -1183,6 +1424,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
+ 			return createToolResultMessage(toolCallId, toolName, result, true);
+ 		}
+ 
++		if (tool.name === "ask") return await this.#runAsk(toolName, toolCallId, args, call.signal);
+ 		const toolResultMessage = await executeTool(this.options, toolName, toolCallId, args);
+ 		return toolResultMessage;
+ 	}
+diff --git a/packages/coding-agent/src/prompts/system/cursor-video-review.md b/packages/coding-agent/src/prompts/system/cursor-video-review.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..96eee5242a73b950bd3ea159b584dee8389b1f24
+--- /dev/null
++++ b/packages/coding-agent/src/prompts/system/cursor-video-review.md
+@@ -0,0 +1,3 @@
++You watch videos for another agent that cannot see or hear them.
++
++Report what the attached videos actually contain: the picture, on-screen text, speech, music and other sound. Give a timestamp (mm:ss) for each finding. Answer the request directly, then list what you could not make out. Never describe more than the videos show; say so when something is unclear.
+diff --git a/packages/coding-agent/src/sdk.ts b/packages/coding-agent/src/sdk.ts
+index a5045325d499d22d4b5d30dc25deea2f45f0eff4..b81221829682268dbbb5707345c24a333cfad7fd 100644
+--- a/packages/coding-agent/src/sdk.ts
++++ b/packages/coding-agent/src/sdk.ts
+@@ -12,17 +12,18 @@ import {
+ 	type StreamFn,
+ 	type ThinkingLevel,
+ } from "@oh-my-pi/pi-agent-core";
+-import type {
+-	Context,
+-	CredentialDisabledEvent,
++import {
++	type Context,
++	type CredentialDisabledEvent,
++	completeSimple,
+ 	Effort,
+-	Message,
+-	Model,
+-	ModelUsageHealth,
+-	ProviderSessionState,
+-	ServiceTier,
+-	ServiceTierByFamily,
+-	SimpleStreamOptions,
++	type Message,
++	type Model,
++	type ModelUsageHealth,
++	type ProviderSessionState,
++	type ServiceTier,
++	type ServiceTierByFamily,
++	type SimpleStreamOptions,
+ } from "@oh-my-pi/pi-ai";
+ import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+ import type { DiscoverAuthStorageOptions } from "@oh-my-pi/pi-ai/auth-broker/discover";
+@@ -4156,6 +4157,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
+ 			// this session did not start on Cursor.
+ 			getEditReplaceTool: getCursorBridgeEditTool,
+ 			getToolContext: () => toolContextStore.getContext(),
++			asyncJobManager: scopedAsyncJobManager,
+ 			mcpResources: cursorMcpResources,
+ 			emitEvent: event => cursorEventEmitter?.(event),
+ 			getTodoPhases: () => session.getTodoPhases(),
+@@ -4175,6 +4177,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
+ 				(toolSession.isToolActive?.("write") === true &&
+ 					toolRegistry.has("write") &&
+ 					toolSession.deviceOnlyWrite !== true),
++			getArtifactsDir: () => sessionManager.getArtifactsDir() ?? undefined,
++			reviewVideos: async ({ modelId, systemPrompt, prompt, videos, signal }) => {
++				const reviewModel = modelRegistry.find("cursor", modelId);
++				if (!reviewModel) throw new Error(`Cursor model ${modelId} is not available`);
++				const sessionId = sessionManager.getSessionId();
++				const response = await completeSimple(
++					reviewModel,
++					{ systemPrompt: [systemPrompt], messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
++					{
++						apiKey: modelRegistry.resolver(reviewModel, sessionId),
++						sessionId,
++						reasoning: Effort.High,
++						cursorVideos: videos,
++						signal,
++					},
++				);
++				if (response.stopReason === "error" || response.stopReason === "aborted") {
++					throw new Error(response.errorMessage ?? `Video review ${response.stopReason}`);
++				}
++				return response.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
++			},
+ 		});
+ 
+ 		// Resolve the live inline-descriptors setting against the active model.
+diff --git a/packages/coding-agent/src/session/settings-stream-fn.ts b/packages/coding-agent/src/session/settings-stream-fn.ts
+index 3a5d85d464259d57b4208d53cd8e8e7e9e665f18..a69000ef9b7ee09f01ed29c3cf13962ca877cc3f 100644
+--- a/packages/coding-agent/src/session/settings-stream-fn.ts
++++ b/packages/coding-agent/src/session/settings-stream-fn.ts
+@@ -25,6 +25,7 @@ import {
+ 	cfgProvidersAnthropicSlowMode,
+ 	cfgProvidersAntigravityEndpoint,
+ 	cfgProvidersCacheRetention,
++	cfgProvidersCursorLiveSteering,
+ 	cfgProvidersMaxInFlightRequests,
+ 	cfgProvidersMuseCodeStoreResponses,
+ 	cfgProvidersOpenaiCodexDaybreak,
+@@ -186,7 +187,13 @@ export function createSettingsAwareStreamFn(
+ 			},
+ 			hideThinkingSummary: streamOptions?.hideThinkingSummary ?? cfgOmitThinking.get(settings),
+ 			// An off switch, not a default: the agent loop always offers its queue.
+-			liveSteering: cfgProvidersOpenaiLiveSteering.get(settings) ? streamOptions?.liveSteering : undefined,
++			liveSteering: (
++				model.api === "cursor-agent"
++					? cfgProvidersCursorLiveSteering.get(settings)
++					: cfgProvidersOpenaiLiveSteering.get(settings)
++			)
++				? streamOptions?.liveSteering
++				: undefined,
+ 			...(fallbacks !== undefined ? { fallbacks } : {}),
+ 			...(storeResponses !== undefined ? { storeResponses } : {}),
+ 			// A per-call worker never switches models: no fallback chain, including a
+diff --git a/packages/coding-agent/src/session/settings.ts b/packages/coding-agent/src/session/settings.ts
+index b65c57ced42b70adee29058e83d2716fe2bd96d5..143e3723678fa3f3b668f80c15ceb8edab77e837 100644
+--- a/packages/coding-agent/src/session/settings.ts
++++ b/packages/coding-agent/src/session/settings.ts
+@@ -1193,6 +1193,19 @@ export const cfgProvidersOpenaiLiveSteering = register({
+ 	},
+ });
+ 
++export const cfgProvidersCursorLiveSteering = register({
++	id: "providers.cursorLiveSteering",
++	type: "boolean",
++	default: false,
++	ui: {
++		tab: "providers",
++		group: "Protocol",
++		label: "Cursor Live Steering",
++		description:
++			"Deliver typed messages and background-job results into a running Cursor turn after each tool call, instead of when the turn ends",
++	},
++});
++
+ export const cfgProvidersMuseCodeStoreResponses = register({
+ 	id: "providers.muse-code.storeResponses",
+ 	type: "boolean",
+diff --git a/packages/coding-agent/src/tools/ask.ts b/packages/coding-agent/src/tools/ask.ts
+index b403f4c214c17868cbe7dd84a0c5e29b50cc5804..b6dbc8ac4120211c7736a2ac3705462f37e38da9 100644
+--- a/packages/coding-agent/src/tools/ask.ts
++++ b/packages/coding-agent/src/tools/ask.ts
+@@ -460,7 +460,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+ 		if (!answered) return cancelAsk();
+ 
+ 		const json = JSON.stringify(answered.data, null, 2);
+-		const details: AskToolDetails = { answers: formAnswers(form, answered.data) };
++		const details: AskToolDetails = { answers: formAnswers(form, answered.data), data: answered.data };
+ 		if (answered.timedOut) {
+ 			details.timedOut = true;
+ 			return {
+diff --git a/packages/coding-agent/test/cursor-exec.test.ts b/packages/coding-agent/test/cursor-exec.test.ts
+index 2bd4150fa02fba99d8a148d8f90d953093078bee..b070952ec7de1873fadd63c3a3637d8c79280ec9 100644
+--- a/packages/coding-agent/test/cursor-exec.test.ts
++++ b/packages/coding-agent/test/cursor-exec.test.ts
+@@ -13,11 +13,15 @@ import {
+ import { type BlockState, handleServerMessage, type ToolCallState } from "@oh-my-pi/pi-ai/providers/cursor";
+ import { CursorExecOrder } from "@oh-my-pi/pi-ai/providers/cursor/exec-order";
+ import { buildPiReadResult, piTruncation } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
++import { askQuestionSuccess, cursorAskToolArgs } from "@oh-my-pi/pi-ai/providers/cursor/interaction-query";
+ import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+ import {
+ 	AgentClientMessageSchema,
+ 	AgentServerMessageSchema,
++	AskQuestionArgs_OptionSchema,
++	AskQuestionArgs_QuestionSchema,
++	AskQuestionArgsSchema,
+ 	DeleteArgsSchema,
+ 	ExecServerMessageSchema,
+ 	McpArgsSchema,
+@@ -27,7 +31,7 @@ import {
+ } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+ import { create, fromBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
+ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+-import { CursorExecHandlers } from "@oh-my-pi/pi-coding-agent/cursor";
++import { CursorExecHandlers, type CursorVideoReviewRequest } from "@oh-my-pi/pi-coding-agent/cursor";
+ import { registerArtifactsDir } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
+ import {
+ 	bridgeToolMap,
+@@ -41,7 +45,9 @@ import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+ import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+ import { BUILTIN_TOOLS, GrepTool, ReadTool, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
++import { AskTool } from "@oh-my-pi/pi-coding-agent/tools/ask";
+ import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
++import { type ChoiceField, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
+ import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools/todo";
+ import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
+ import type { TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+@@ -2813,3 +2819,329 @@ describe("CursorExecHandlers passive tool context", () => {
+ 		}
+ 	});
+ });
++
++describe("CursorExecHandlers.askQuestion bridge", () => {
++	const fakeAsk = (details: unknown): Tool =>
++		({
++			name: "ask",
++			label: "Ask",
++			description: "fake ask dialog",
++			parameters: type({}),
++			async execute() {
++				return { content: [{ type: "text", text: "User answers: …" }], details };
++			},
++		}) as unknown as Tool;
++	const call = { toolCallId: "tool_ask_1", args: { html: "<form></form>" } };
++
++	it("answers a Cursor question through the ask form, mapping picked labels back to option ids", async () => {
++		const option = (id: string, label: string) => create(AskQuestionArgs_OptionSchema, { id, label });
++		const args = create(AskQuestionArgsSchema, {
++			title: "Storage & <cache>",
++			questions: [
++				create(AskQuestionArgs_QuestionSchema, {
++					id: "db",
++					prompt: 'Which "DB"?',
++					options: [option("pg", 'Postgres "16"'), option("lite", "SQLite <3")],
++				}),
++				create(AskQuestionArgs_QuestionSchema, {
++					id: "extras",
++					prompt: "Extras?",
++					allowMultiple: true,
++					options: [option("cache", "Cache & queue"), option("cdn", "CDN")],
++				}),
++			],
++		});
++		const plan = cursorAskToolArgs(args);
++		const shown: string[][] = [];
++		const formDialog = async (html: string) => {
++			const choices = parseHtmlForm(html).fields.filter((field): field is ChoiceField => field.kind === "choice");
++			const labels = choices.map(field => field.options.map(o => spansText(o.label).trim()));
++			shown.push(...labels);
++			const [db, extras] = choices;
++			return {
++				data: {
++					[db!.name]: db!.options[labels[0]!.indexOf('Postgres "16"')]!.value,
++					[extras!.name]: [extras!.options[labels[1]!.indexOf("Cache & queue")]!.value, "a CDN"],
++				},
++			};
++		};
++		const session = createTestSession(".", {
++			hasUI: true,
++			canPromptUser: true,
++			settings: Settings.isolated({ "ask.notify": "off" }),
++		});
++		const handlers = new CursorExecHandlers({
++			cwd: ".",
++			tools: new Map<string, Tool>([["ask", new AskTool(session) as unknown as Tool]]),
++			getToolContext: () => ({ hasUI: true, ui: { formDialog }, abort: () => {} }) as unknown as AgentToolContext,
++		});
++
++		const result = await handlers.askQuestion({ toolCallId: "tool_ask_1", args: plan.args });
++
++		expect(result.toolResult.isError).toBe(false);
++		expect(shown).toEqual([
++			['Postgres "16"', "SQLite <3"],
++			["Cache & queue", "CDN"],
++		]);
++		expect(askQuestionSuccess(args, plan.fields, result.data!).result).toMatchObject({
++			case: "success",
++			value: {
++				answers: [
++					{ questionId: "db", selectedOptionIds: ["pg"], freeformText: "" },
++					{ questionId: "extras", selectedOptionIds: ["cache"], freeformText: "a CDN" },
++				],
++			},
++		});
++	});
++
++	it("runs one question at a time", async () => {
++		const events: string[] = [];
++		const { promise: firstAnswered, resolve: answerFirst } = Promise.withResolvers<void>();
++		const ask = {
++			name: "ask",
++			label: "Ask",
++			description: "fake ask dialog",
++			parameters: type({}),
++			async execute(id: string) {
++				events.push(`open ${id}`);
++				if (id === "first") await firstAnswered;
++				events.push(`close ${id}`);
++				return { content: [{ type: "text", text: "User answers: …" }], details: { answers: [], data: { q1: id } } };
++			},
++		} as unknown as Tool;
++		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["ask", ask]]) });
++		const first = handlers.askQuestion({ ...call, toolCallId: "first" });
++		const second = handlers.askQuestion({ ...call, toolCallId: "second" });
++		await Bun.sleep(10);
++		expect(events).toEqual(["open first"]);
++		answerFirst();
++		expect((await second).data).toEqual({ q1: "second" });
++		expect((await first).data).toEqual({ q1: "first" });
++		expect(events).toEqual(["open first", "close first", "open second", "close second"]);
++	});
++
++	it("queues an MCP ask call behind an open native question", async () => {
++		const events: string[] = [];
++		const { promise: firstAnswered, resolve: answerFirst } = Promise.withResolvers<void>();
++		const ask = {
++			name: "ask",
++			label: "Ask",
++			description: "fake ask dialog",
++			parameters: type({}),
++			async execute(id: string) {
++				events.push(`open ${id}`);
++				if (id === "native") await firstAnswered;
++				events.push(`close ${id}`);
++				return { content: [{ type: "text", text: "User answers: …" }], details: { answers: [], data: { q1: id } } };
++			},
++		} as unknown as Tool;
++		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["ask", ask]]) });
++		const native = handlers.askQuestion({ ...call, toolCallId: "native" });
++		const viaMcp = handlers.mcp({
++			name: "ask",
++			toolName: "ask",
++			toolCallId: "mcp",
++			providerIdentifier: "pi-agent",
++			args: { html: "<form></form>" },
++			rawArgs: {},
++		});
++		await Bun.sleep(10);
++		expect(events).toEqual(["open native"]);
++		answerFirst();
++		expect((await viaMcp).isError).toBe(false);
++		await native;
++		expect(events).toEqual(["open native", "close native", "open mcp", "close mcp"]);
++	});
++
++	it("closes an MCP ask dialog when the turn is aborted and moves on to the next question", async () => {
++		const events: string[] = [];
++		const ask = {
++			name: "ask",
++			label: "Ask",
++			description: "fake ask dialog",
++			parameters: type({}),
++			async execute(id: string, _args: unknown, signal?: AbortSignal) {
++				events.push(`open ${id}`);
++				if (id === "mcp") {
++					const { promise, reject } = Promise.withResolvers<never>();
++					signal?.addEventListener("abort", () => reject(new Error("Ask input was cancelled")), { once: true });
++					await promise;
++				}
++				events.push(`close ${id}`);
++				return { content: [{ type: "text", text: "User answers: …" }], details: { answers: [], data: { q1: id } } };
++			},
++		} as unknown as Tool;
++		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["ask", ask]]) });
++		const controller = new AbortController();
++		const viaMcp = handlers.mcp({
++			name: "ask",
++			toolName: "ask",
++			toolCallId: "mcp",
++			providerIdentifier: "pi-agent",
++			args: { html: "<form></form>" },
++			rawArgs: {},
++			signal: controller.signal,
++		});
++		const native = handlers.askQuestion({ ...call, toolCallId: "native" });
++		await Bun.sleep(10);
++		expect(events).toEqual(["open mcp"]);
++		controller.abort();
++		expect((await viaMcp).isError).toBe(true);
++		expect((await native).data).toEqual({ q1: "native" });
++		expect(events).toEqual(["open mcp", "open native", "close native"]);
++	});
++
++	it("closes the dialog when the turn is aborted and moves on to the next question", async () => {
++		const events: string[] = [];
++		const ask = {
++			name: "ask",
++			label: "Ask",
++			description: "fake ask dialog",
++			parameters: type({}),
++			async execute(id: string, _args: unknown, signal?: AbortSignal) {
++				events.push(`open ${id}`);
++				if (id === "first") {
++					const { promise, reject } = Promise.withResolvers<never>();
++					signal?.addEventListener("abort", () => reject(new Error("Ask input was cancelled")), { once: true });
++					await promise;
++				}
++				events.push(`close ${id}`);
++				return { content: [{ type: "text", text: "User answers: …" }], details: { answers: [], data: { q1: id } } };
++			},
++		} as unknown as Tool;
++		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["ask", ask]]) });
++		const controller = new AbortController();
++		const first = handlers.askQuestion({ ...call, toolCallId: "first", signal: controller.signal });
++		const second = handlers.askQuestion({ ...call, toolCallId: "second" });
++		await Bun.sleep(10);
++		expect(events).toEqual(["open first"]);
++		controller.abort();
++		const aborted = await first;
++		expect(aborted.data).toBeUndefined();
++		expect(aborted.toolResult.isError).toBe(true);
++		expect((await second).data).toEqual({ q1: "second" });
++		expect(events).toEqual(["open first", "open second", "close second"]);
++	});
++
++	it("skips a queued question whose turn was aborted before it was shown", async () => {
++		const opened: string[] = [];
++		const { promise: firstAnswered, resolve: answerFirst } = Promise.withResolvers<void>();
++		const ask = {
++			name: "ask",
++			label: "Ask",
++			description: "fake ask dialog",
++			parameters: type({}),
++			async execute(id: string) {
++				opened.push(id);
++				if (id === "first") await firstAnswered;
++				return { content: [{ type: "text", text: "User answers: …" }], details: { answers: [], data: { q1: id } } };
++			},
++		} as unknown as Tool;
++		const handlers = new CursorExecHandlers({ cwd: ".", tools: new Map([["ask", ask]]) });
++		const controller = new AbortController();
++		const first = handlers.askQuestion({ ...call, toolCallId: "first" });
++		const second = handlers.askQuestion({ ...call, toolCallId: "second", signal: controller.signal });
++		await Bun.sleep(10);
++		controller.abort();
++		answerFirst();
++		await first;
++		const skipped = await second;
++		expect(opened).toEqual(["first"]);
++		expect(skipped.data).toBeUndefined();
++		expect(skipped.toolResult).toMatchObject({ toolCallId: "second", toolName: "ask", isError: true });
++	});
++
++	it("returns no form data for a timed-out form or a session without ask", async () => {
++		const timedOut = new CursorExecHandlers({
++			cwd: ".",
++			tools: new Map([["ask", fakeAsk({ answers: [], data: { q1: "SQLite" }, timedOut: true })]]),
++		});
++		expect((await timedOut.askQuestion(call)).data).toBeUndefined();
++
++		const headless = new CursorExecHandlers({ cwd: ".", tools: new Map() });
++		const result = await headless.askQuestion(call);
++		expect(result.data).toBeUndefined();
++		expect(result.toolResult.isError).toBe(true);
++	});
++});
++
++describe("CursorExecHandlers videoReview", () => {
++	let artifacts: string;
++
++	beforeEach(async () => {
++		artifacts = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-video-review-"));
++	});
++
++	afterEach(async () => {
++		await removeWithRetries(artifacts);
++	});
++
++	// The provider reaches the handlers through the glyph codec's Proxy, which calls them with the proxy as `this`.
++	const videoHandlers = (reviewVideos: (request: CursorVideoReviewRequest) => Promise<string>) =>
++		new Proxy(
++			new CursorExecHandlers({ cwd: ".", tools: new Map(), reviewVideos, getArtifactsDir: () => artifacts }),
++			{},
++		);
++
++	it("advertises videoReview with its folder only while a video model can run it", () => {
++		const handlers = videoHandlers(async () => "");
++		expect(handlers.artifactsFolder()).toBe(artifacts);
++		const [subagent, ...rest] = handlers.customSubagents();
++		expect(rest).toEqual([]);
++		expect(subagent).toMatchObject({ name: "videoReview", model: "gemini-3.1-pro", readonly: true });
++		expect(subagent?.description).toContain(artifacts);
++
++		const withoutModel = new CursorExecHandlers({ cwd: ".", tools: new Map(), getArtifactsDir: () => artifacts });
++		expect(withoutModel.customSubagents()).toEqual([]);
++		expect(withoutModel.artifactsFolder()).toBeUndefined();
++		const withoutFolder = new CursorExecHandlers({ cwd: ".", tools: new Map(), reviewVideos: async () => "" });
++		expect(withoutFolder.customSubagents()).toEqual([]);
++	});
++
++	it("sends the attached videos to the video model and reports its answer", async () => {
++		const videoPath = path.join(artifacts, "clip.mp4");
++		await Bun.write(videoPath, Uint8Array.of(7, 8, 9));
++		const requests: CursorVideoReviewRequest[] = [];
++		const outcome = await videoHandlers(async request => {
++			requests.push(request);
++			return "00:01 a red ball bounces; a beep plays throughout.";
++		}).subagent({
++			toolCallId: "task-1",
++			subagentType: "videoReview",
++			prompt: "What happens?",
++			modelId: "gemini-3.1-pro",
++			videos: [{ path: videoPath, mimeType: "video/mp4" }],
++		});
++
++		expect(requests).toHaveLength(1);
++		expect(requests[0]).toMatchObject({ modelId: "gemini-3.1-pro", prompt: "What happens?" });
++		expect(requests[0]?.videos.map(video => ({ ...video, data: Array.from(video.data) }))).toEqual([
++			{ path: videoPath, mimeType: "video/mp4", data: [7, 8, 9] },
++		]);
++		expect(outcome.finalMessage).toBe("00:01 a red ball bounces; a beep plays throughout.");
++		expect(outcome.toolResult).toMatchObject({ toolCallId: "task-1", toolName: "task", isError: false });
++	});
++
++	it("refuses a call with no video or past Cursor's size limit without asking the model", async () => {
++		let asked = false;
++		const handlers = videoHandlers(async () => {
++			asked = true;
++			return "";
++		});
++		const call = { toolCallId: "task-2", subagentType: "videoReview", prompt: "What happens?" };
++
++		const imageOnly = await handlers.subagent({
++			...call,
++			videos: [{ path: path.join(artifacts, "shot.png"), mimeType: "image/png" }],
++		});
++		expect(imageOnly.toolResult.isError).toBe(true);
++		expect(imageOnly.finalMessage).toBeUndefined();
++
++		const bigPath = path.join(artifacts, "big.mp4");
++		await Bun.write(bigPath, "");
++		await fs.truncate(bigPath, 36 * 1024 * 1024);
++		const tooBig = await handlers.subagent({ ...call, videos: [{ path: bigPath, mimeType: "video/mp4" }] });
++		expect(tooBig.toolResult.isError).toBe(true);
++		expect(asked).toBe(false);
++	});
++});
+diff --git a/packages/coding-agent/test/tools/ask.test.ts b/packages/coding-agent/test/tools/ask.test.ts
+index 76ab387aaefebf99cc1899269bc4437293f7a932..0dccd82af0d08d2873793418d8ff1a1f3e671525 100644
+--- a/packages/coding-agent/test/tools/ask.test.ts
++++ b/packages/coding-agent/test/tools/ask.test.ts
+@@ -119,6 +119,7 @@ describe("AskTool form dialog", () => {
+ 				{ name: "store", question: "Session store", answer: "Redis" },
+ 				{ name: "ttl", question: "Lifetime (days)", answer: "7" },
+ 			],
++			data: { store: "redis", ttl: 7 },
+ 		});
+ 	});
+ 
+diff --git a/packages/tui/CHANGELOG.md b/packages/tui/CHANGELOG.md
+index b5c8f37d60776af09ad2a2c42a558d4539205cc5..67933bd82509c612a12d0cab1f6784fa5402da81 100644
+--- a/packages/tui/CHANGELOG.md
++++ b/packages/tui/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Added `data` to `AskToolDetails`: the submitted form data by control name, as the model receives it
++
+ ### Changed
+ 
+ - `grep` and `ast_grep` results with no matches render as one line with `0 matches` in the warning color, dropping the separate `No matches found` row ([#18700](https://github.com/can1357/oh-my-pi/pull/18700) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+diff --git a/packages/tui/src/render/render-utils.ts b/packages/tui/src/render/render-utils.ts
+index 81761c1b5dbeffd932547f8da3d85b3d47818f61..279aad8ee73efcd18bf1a3d1bbae17a2ff9b9556 100644
+--- a/packages/tui/src/render/render-utils.ts
++++ b/packages/tui/src/render/render-utils.ts
+@@ -24,39 +24,7 @@ export { replaceTabs, truncateToWidth, wrapTextWithAnsi } from "../utils";
+ /** A thinking selector configured as a concrete level or automatic selection. */
+ export type ConfiguredThinkingLevel = ThinkingLevel | "auto";
+ 
+-/**
+- * Normalize stray carriage returns in model-authored display text. Some models
+- * (observed with GLM via OpenRouter) degenerate into injecting `\r` runs between
+- * words inside JSON string values; CommonMark treats a lone `\r` as a line
+- * ending, which splatters the text one word per row. CRLF becomes LF, CR runs
+- * collapse to a single space — word separators in prose, one indent unit in
+- * mangled code previews.
+- */
+-export function sanitizeCarriageReturns(text: string): string {
+-	if (!text.includes("\r")) return text;
+-	return text.replaceAll("\r\n", "\n").replace(/\r+/g, " ");
+-}
+-
+-/**
+- * Sanitize raw ask option labels into unique, action-safe display copies.
+- * Degenerate input can sanitize alike (`Retry\rnow`/`Retry now`) or match a
+- * runtime action row (`Other (type your own)`); both would answer the wrong
+- * row, so colliding entries take a numeric suffix. Order and length are
+- * preserved, so indices still align with the original labels for mapping
+- * answers and dialog state back. Every ask race participant (local dialog,
+- * guest selector) must call this with the same `reservedLabels` so a
+- * question renders identically wherever it is answered.
+- */
+-export function disambiguateDisplayLabels(rawLabels: string[], reservedLabels: readonly string[]): string[] {
+-	const taken = new Set<string>(reservedLabels);
+-	return rawLabels.map(raw => {
+-		const base = sanitizeCarriageReturns(raw);
+-		let candidate = base;
+-		for (let suffix = 2; taken.has(candidate); suffix++) candidate = `${base} (${suffix})`;
+-		taken.add(candidate);
+-		return candidate;
+-	});
+-}
++export { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-utils";
+ 
+ // =============================================================================
+ // Standardized Display Constants
+diff --git a/packages/tui/src/tools/ask.ts b/packages/tui/src/tools/ask.ts
+index a3831ae04e051784da4dfe6f1569ec68f4bc18fc..a306ed6a8f0a30bec00d20b8205689cb88fa56f3 100644
+--- a/packages/tui/src/tools/ask.ts
++++ b/packages/tui/src/tools/ask.ts
+@@ -17,7 +17,7 @@ import { wrapPrefixedLine } from "../render/hanging-wrap";
+ 
+ import { formatStatusIcon, formatTitle, PREVIEW_LIMITS } from "../render/render-utils";
+ 
+-import { type FormAnswer, fieldQuestions, OTHER_LABEL } from "../html-form/data";
++import { type FormAnswer, fieldQuestions, type HtmlFormData, OTHER_LABEL } from "../html-form/data";
+ import {
+ 	type ChoiceField,
+ 	type FormField,
+@@ -31,6 +31,8 @@ import {
+ export interface AskToolDetails {
+ 	/** Each named field's question and answer text, in form order (from `formAnswers`). */
+ 	answers: FormAnswer[];
++	/** The submitted form data by control name, as the model receives it; absent when nothing was submitted. */
++	data?: HtmlFormData;
+ 	/** The deadline submitted the form's current values instead of the user. */
+ 	timedOut?: boolean;
+ }
+diff --git a/packages/utils/CHANGELOG.md b/packages/utils/CHANGELOG.md
+index 344d95121ef8c1abc4f8d48e8b16850ddb1c0379..5c508c7cdcd3cc4f88970102c21d246c59ba2d2d 100644
+--- a/packages/utils/CHANGELOG.md
++++ b/packages/utils/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Changed
++
++- Moved `sanitizeCarriageReturns` and `disambiguateDisplayLabels` from `pi-tui` into `pi-utils` so the Cursor provider gives repeated native `AskQuestion` option labels distinct form values; `pi-tui` re-exports both ([#16497](https://github.com/can1357/oh-my-pi/pull/16497) by [@morali](https://github.com/morali)).
++
+ ## [18.18.2] - 2026-11-08
+ 
+ ### Added
+diff --git a/packages/utils/src/sanitize-text.ts b/packages/utils/src/sanitize-text.ts
+index a56d743e64328c08a0b5aa9c88c4c985f94ffd54..a7a1165450d40cff050569dd4a6dffd324924d78 100644
+--- a/packages/utils/src/sanitize-text.ts
++++ b/packages/utils/src/sanitize-text.ts
+@@ -164,3 +164,37 @@ export function escapeXmlAttribute(input: string): string {
+ 	}
+ 	return output;
+ }
++
++/**
++ * Normalize stray carriage returns in model-authored display text. Some models
++ * (observed with GLM via OpenRouter) degenerate into injecting `\r` runs between
++ * words inside JSON string values; CommonMark treats a lone `\r` as a line
++ * ending, which splatters the text one word per row. CRLF becomes LF, CR runs
++ * collapse to a single space — word separators in prose, one indent unit in
++ * mangled code previews.
++ */
++export function sanitizeCarriageReturns(text: string): string {
++	if (!text.includes("\r")) return text;
++	return text.replaceAll("\r\n", "\n").replace(/\r+/g, " ");
++}
++
++/**
++ * Sanitize raw ask option labels into unique, action-safe display copies.
++ * Degenerate input can sanitize alike (`Retry\rnow`/`Retry now`) or match a
++ * runtime action row (`Other (type your own)`); both would answer the wrong
++ * row, so colliding entries take a numeric suffix. Order and length are
++ * preserved, so indices still align with the original labels for mapping
++ * answers and dialog state back. Every ask race participant (local dialog,
++ * guest selector) must call this with the same `reservedLabels` so a
++ * question renders identically wherever it is answered.
++ */
++export function disambiguateDisplayLabels(rawLabels: string[], reservedLabels: readonly string[]): string[] {
++	const taken = new Set<string>(reservedLabels);
++	return rawLabels.map(raw => {
++		const base = sanitizeCarriageReturns(raw);
++		let candidate = base;
++		for (let suffix = 2; taken.has(candidate); suffix++) candidate = `${base} (${suffix})`;
++		taken.add(candidate);
++		return candidate;
++	});
++}
