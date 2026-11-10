@@ -22,14 +22,25 @@ source "$REPO/ortak.sh"
 
 OMP_KAYNAK=${OMP_KAYNAK:-$HOME/Projeler/oh-my-pi}
 ONBELLEK=${XDG_CACHE_HOME:-$HOME/.cache}/omp-yamalari
-DERLEME_GUNLUGU=$ONBELLEK/derleme.log
 BUN=$(command -v bun || printf '%s\n' "$HOME/.bun/bin/bun")
 NATIVE_VARLIK=$NATIVE_MODERN.zst
-# Eklenen satırlarda bunlardan biri geçerse yayın durur: ev dizini yolları, token ve anahtar biçimleri.
-# Yayınlanmaması gereken kişisel desenler (sunucu adresleri gibi) repoya değil GIZLI_DESEN_DOSYASI'na yazılır:
-# satır başına bir ERE, `#` ile başlayan satırlar yorum.
-GIZLI_DESEN='/home/[^/[:space:]]+/|/Users/|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_|sk-[A-Za-z0-9_-]{20,}|BEGIN [A-Z ]*PRIVATE KEY'
+# Yayına girecek satırlarda (yamada eklenenler ve dosya başlıkları, README'nin yamalar bloğu) bunlardan biri
+# geçerse yayın durur: ev dizini yolları, token ve anahtar biçimleri. Yayınlanmaması gereken kişisel desenler
+# (sunucu adresleri gibi) repoya değil GIZLI_DESEN_DOSYASI'na yazılır: satır başına bir ERE, `#` ile başlayan
+# satırlar yorum. Yanlış alarm veren bir satır IZINLI_SATIR_DOSYASI'na olduğu gibi (yamada baştaki + olmadan)
+# yazılırsa bildirilmez; orada da `#` ile başlayan satırlar yorumdur.
+GIZLI_DESENLER=(
+	'/home/[^/[:space:]]+'
+	'/Users/'
+	'gh[pousr]_[A-Za-z0-9_]{20,}'
+	'github_pat_'
+	'(^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}'
+	'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.'
+	'AIza[0-9A-Za-z_-]{30,}'
+	'BEGIN [A-Z ]*PRIVATE KEY'
+)
 GIZLI_DESEN_DOSYASI=${XDG_CONFIG_HOME:-$HOME/.config}/omp-yamalari/gizli-desenler
+IZINLI_SATIR_DOSYASI=${XDG_CONFIG_HOME:-$HOME/.config}/omp-yamalari/izinli-satirlar
 # git status'un isteğe bağlı index tazelemesi canlı omp deposunun index'ine yazmasın.
 export GIT_OPTIONAL_LOCKS=0
 
@@ -58,19 +69,40 @@ utc_simdi() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 boyut() { numfmt --to=iec-i --suffix=B "$(stat -c %s -- "$1")"; }
 
-# derleme_kaldir: geçici derleme worktree'sini, yarım kalmış olsa da, omp deposundan ve diskten kaldırır.
+# worktree_kaldir <derleme-dizini>: dizindeki omp worktree'sini, yarım kalmış ya da kilitli olsa da, omp
+# deposundaki kaydıyla birlikte siler. Worktree olarak tanınmayan bir dizinin kaydı ancak dizin silinince kalkar.
+worktree_kaldir() {
+	git -C "$OMP_KAYNAK" worktree remove -f -f "$1/omp" >/dev/null 2>&1 || true
+	if [[ -e $1/omp ]]; then
+		rm -rf -- "$1/omp"
+		git -C "$OMP_KAYNAK" worktree remove -f -f "$1/omp" >/dev/null 2>&1 || true
+	fi
+	rm -rf -- "$1"
+}
+
 derleme_kaldir() {
 	[[ -n $DERLEME_DIZINI ]] || return 0
-	git -C "$OMP_KAYNAK" worktree remove --force "$DERLEME_DIZINI/omp" >/dev/null 2>&1 || true
-	if [[ -e $DERLEME_DIZINI/omp ]]; then
-		rm -rf -- "$DERLEME_DIZINI/omp"
-		git -C "$OMP_KAYNAK" worktree remove --force "$DERLEME_DIZINI/omp" >/dev/null 2>&1 || true
-	fi
-	rm -rf -- "$DERLEME_DIZINI"
+	worktree_kaldir "$DERLEME_DIZINI"
 	DERLEME_DIZINI=
 }
 
+# artiklari_temizle: öldürülmüş bir önceki çalışmanın bıraktığı derleme worktree'lerini (dizini silinmiş olsa da
+# kaydıyla) ve yarım native dizinlerini siler. Omp deposunun başka worktree'lerine dokunmamak için
+# `git worktree prune` kullanılmaz: o, takılı olmayan bir diskteki worktree'nin kaydını da silerdi.
+artiklari_temizle() {
+	local satir d
+	while IFS= read -r -d '' satir; do
+		[[ $satir == "worktree $ONBELLEK/derleme."*/omp ]] || continue
+		d=${satir#worktree }
+		worktree_kaldir "${d%/omp}"
+	done < <(git -C "$OMP_KAYNAK" worktree list --porcelain -z 2>/dev/null)
+	for d in "$ONBELLEK"/derleme.*/ "$ONBELLEK"/native/.yeni.*/; do
+		[[ ! -d $d ]] || rm -rf -- "$d"
+	done
+}
+
 temizle() {
+	trap '' INT TERM HUP
 	derleme_kaldir
 	[[ -z $YENI_NATIVE ]] || rm -rf -- "$YENI_NATIVE"
 	[[ -z $GECICI ]] || rm -rf -- "$GECICI"
@@ -83,10 +115,9 @@ izinli_mi() {
 	return 1
 }
 
-# repo_denetle: push öncesi repoda yalnız yayına ait dosyalar değişmiş olmalı; main dalı, omp-yamalari'yı
-# gösteren origin ve gh oturumu gerekir.
-repo_denetle() {
-	local kayit eski url
+# repo_dosyalarini_denetle: repoda yalnız yayına ait dosyalar değişmiş olmalı; `git add -A` hepsini commit eder.
+repo_dosyalarini_denetle() {
+	local kayit eski
 	local -a yabanci=()
 	git -C "$REPO" status --porcelain=v1 -z --untracked-files=all >"$GECICI/repo-durumu"
 	while IFS= read -r -d '' kayit; do
@@ -100,10 +131,17 @@ repo_denetle() {
 		printf '  %s\n' "${yabanci[@]}" >&2
 		hata "$REPO içinde yayına ait olmayan değişiklikler var (yukarıda); taşı, sil ya da ayrıca commit et"
 	fi
+}
+
+# repo_denetle: push öncesi repoda yalnız yayına ait dosyalar değişmiş olmalı; main dalı, omp-yamalari'yı
+# gösteren origin ve gh oturumu gerekir.
+repo_denetle() {
+	local url
+	repo_dosyalarini_denetle
 	[[ $(git -C "$REPO" symbolic-ref -q --short HEAD || true) == main ]] || hata "$REPO main dalında değil"
 	url=$(git -C "$REPO" remote get-url origin 2>/dev/null) || hata "$REPO içinde origin remote'u yok"
 	[[ ${url%.git} == *github.com[:/]"$OMP_YAMALARI_GH" ]] || hata "origin ($url) $OMP_YAMALARI_GH deposunu göstermiyor"
-	gh auth status >/dev/null 2>&1 || hata "gh oturumu açık değil (gh auth login)"
+	gh auth status >/dev/null 2>&1 9>&- || hata "gh oturumu açık değil (gh auth login)"
 }
 
 onceki() { manifest_oku "$ONCEKI" "$1"; }
@@ -146,7 +184,7 @@ release_oku() {
 	local notlar=$GECICI/release-notlari
 	R_SHA256='' R_GLIBC=''
 	((GH_VAR)) || return 1
-	if ! gh api "repos/$OMP_YAMALARI_GH/releases/tags/$RELEASE_ETIKETI" >"$GECICI/release.json" 2>"$GECICI/release.err"; then
+	if ! gh api "repos/$OMP_YAMALARI_GH/releases/tags/$RELEASE_ETIKETI" >"$GECICI/release.json" 2>"$GECICI/release.err" 9>&-; then
 		grep -q 'HTTP 404' "$GECICI/release.err" && return 1
 		hata "GitHub Releases sorgulanamadı: $(tr '\n' ' ' <"$GECICI/release.err")"
 	fi
@@ -165,18 +203,43 @@ release_oku() {
 		hata "$RELEASE_ETIKETI notlarından NATIVE_SHA256/NATIVE_GLIBC okunamadı"
 }
 
+# npm_native_sorgula <sürüm>: npm'deki native paketinin tarball adresini ve integrity'sini NPM_TARBALL ile
+# NPM_INTEGRITY'ye okur; sürüm npm'de yoksa (HTTP 404) 1 döner. Registry'ye ulaşılamaz ya da başka bir yanıt
+# (429, 5xx) gelirse yayını durdurur: geçici bir ağ hatası yayınlanan native'i sessizce değiştirmemeli.
+# $(...) gibi bir alt kabukta çağrılmamalı; hata ancak ana kabukta bütün betiği durdurur.
+npm_native_sorgula() {
+	local yanit=$GECICI/npm.json kod dist
+	NPM_TARBALL='' NPM_INTEGRITY=''
+	kod=$(curl -sSL -o "$yanit" -w '%{http_code}' "https://registry.npmjs.org/$NPM_NATIVE_PAKETI/$1" 9>&-) ||
+		hata "npm registry'ye ulaşılamadı ($NPM_NATIVE_PAKETI@$1)"
+	case $kod in
+	200) ;;
+	404) return 1 ;;
+	*) hata "npm registry $NPM_NATIVE_PAKETI@$1 için HTTP $kod döndü" ;;
+	esac
+	dist=$("$BUN" -e '
+		const d = (await Bun.file(process.argv[1]).json()).dist ?? {};
+		console.log(`${d.tarball ?? ""} ${d.integrity ?? ""}`);' "$yanit") ||
+		hata "npm registry yanıtı okunamadı ($NPM_NATIVE_PAKETI@$1)"
+	NPM_TARBALL=${dist%% *}
+	NPM_INTEGRITY=${dist#* }
+	[[ $NPM_TARBALL =~ ^https://[^[:space:]]+$ && $NPM_INTEGRITY =~ ^sha512-[A-Za-z0-9+/]+={0,2}$ ]] ||
+		hata "npm registry yanıtında $NPM_NATIVE_PAKETI@$1 için tarball adresi ya da sha512 integrity yok"
+}
+
 # native_onceki: (a) son commit edilmiş yayın aynı native anahtarını kullanıyorsa ve o native hâlâ
 # indirilebiliyorsa native alanları aynen korunur.
 native_onceki() {
-	local s i b
+	local s i
 	[[ $(onceki NATIVE_ANAHTAR) == "$NATIVE_ANAHTAR" ]] || return 1
 	case $(onceki NATIVE_KAYNAK) in
 	npm)
 		s=$(onceki NATIVE_NPM_SURUM)
 		i=$(onceki NATIVE_NPM_INTEGRITY)
 		[[ -n $s ]] || return 1
-		b=$(npm_native_bilgi "$s") || return 1
-		[[ ${b#* } == "$i" ]] || return 1
+		npm_native_sorgula "$s" || return 1
+		[[ $NPM_INTEGRITY == "$i" ]] ||
+			hata "npm'deki $NPM_NATIVE_PAKETI@$s integrity'si önceki yayındakinden farklı; yayımlanmış npm sürümü değişmez, elle incele"
 		native_npm "$s" "$i"
 		;;
 	release)
@@ -190,12 +253,13 @@ native_onceki() {
 
 # native_npm_ara: (b) son 10 kararlı upstream sürümünden native anahtarı aynı olan en yenisinin npm'deki native'i.
 native_npm_ara() {
-	local t c b
+	local t c k
 	for t in "${SON_ETIKETLER[@]}"; do
-		c=$(git -C "$OMP_KAYNAK" rev-parse -q --verify "refs/tags/$t^{commit}") || continue
-		[[ $(native_anahtar "$GITDIR" "$c") == "$NATIVE_ANAHTAR" ]] || continue
-		b=$(npm_native_bilgi "${t#v}") || continue
-		native_npm "${t#v}" "${b#* }"
+		c=$(git -C "$OMP_KAYNAK" rev-parse -q --verify "refs/tags/$t^{commit}") || hata "upstream etiketi $t yerelde yok"
+		k=$(native_anahtar "$GITDIR" "$c" 9>&-) || hata "$t için native anahtarı hesaplanamadı"
+		[[ $k == "$NATIVE_ANAHTAR" ]] || continue
+		npm_native_sorgula "${t#v}" || continue
+		native_npm "${t#v}" "$NPM_INTEGRITY"
 		return 0
 	done
 	return 1
@@ -232,10 +296,11 @@ native_derle() {
 	wt=$DERLEME_DIZINI/omp
 	bilgi "native derleniyor (birkaç dakika sürer); günlük: $DERLEME_GUNLUGU"
 	printf '== %s native derlemesi: anahtar %s, commit %s\n' "$(utc_simdi)" "$NATIVE_ANAHTAR" "$YAMALI_COMMIT" >"$DERLEME_GUNLUGU"
-	git -C "$OMP_KAYNAK" -c core.hooksPath=/dev/null worktree add --detach "$wt" "$YAMALI_COMMIT" >>"$DERLEME_GUNLUGU" 2>&1 || true
+	git -C "$OMP_KAYNAK" -c core.hooksPath=/dev/null worktree add --detach "$wt" "$YAMALI_COMMIT" >>"$DERLEME_GUNLUGU" 2>&1 9>&- ||
+		true
 	# Kısmi (blob:none) klonda ilk checkout bir dosyayı atlayabiliyor; ikinci checkout eksik nesneyi çeker.
 	if [[ -e $wt/.git && -n $(git -C "$wt" status --porcelain --untracked-files=no) ]]; then
-		git -C "$wt" checkout -f HEAD -- . >>"$DERLEME_GUNLUGU" 2>&1 || true
+		git -C "$wt" checkout -f HEAD -- . >>"$DERLEME_GUNLUGU" 2>&1 9>&- || true
 	fi
 	[[ -e $wt/.git && -z $(git -C "$wt" status --porcelain --untracked-files=no) ]] ||
 		derleme_hatasi "geçici worktree eksiksiz oluşturulamadı"
@@ -247,7 +312,7 @@ native_derle() {
 		env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u CARGO_BUILD_TARGET -u OMP_NATIVE_FEATURES \
 			PATH="$(dirname -- "$BUN"):$PATH" CARGO_TARGET_DIR="$hedef" CARGO_BUILD_TARGET_DIR="$hedef" \
 			OMP_NATIVE_BUILD_BACKEND=cargo OMP_NATIVE_CARGO_PROFILE=ci \
-			"$BUN" --cwd=packages/natives run build) >>"$DERLEME_GUNLUGU" 2>&1; then
+			"$BUN" --cwd=packages/natives run build) >>"$DERLEME_GUNLUGU" 2>&1 9>&-; then
 		derleme_hatasi "bun install ya da native derlemesi başarısız"
 	fi
 	[[ -f $wt/packages/natives/native/$NATIVE_MODERN ]] || derleme_hatasi "derleme $NATIVE_MODERN üretmedi"
@@ -268,7 +333,7 @@ native_derle() {
 				process.exit(1);
 			}
 			console.log(`yüklendi: ${s.path} (${s.version})`);
-			process.exit(0);' "$kok") >>"$DERLEME_GUNLUGU" 2>&1; then
+			process.exit(0);' "$kok") >>"$DERLEME_GUNLUGU" 2>&1 9>&-; then
 		derleme_hatasi "derlenen native worktree'nin yükleyicisiyle yüklenemedi"
 	fi
 	sure=$((SECONDS - baslangic))
@@ -276,7 +341,7 @@ native_derle() {
 	YENI_NATIVE=$(mktemp -d "$ONBELLEK/native/.yeni.XXXXXX")
 	cp --reflink=auto -- "$wt/packages/natives/native/$NATIVE_MODERN" "$YENI_NATIVE/$NATIVE_MODERN"
 	derleme_kaldir
-	zstd -q -19 --long=27 -T0 -o "$YENI_NATIVE/$NATIVE_VARLIK" -- "$YENI_NATIVE/$NATIVE_MODERN"
+	zstd -q -19 --long=27 -T0 -o "$YENI_NATIVE/$NATIVE_VARLIK" -- "$YENI_NATIVE/$NATIVE_MODERN" 9>&-
 	sha=$(sha256sum <"$YENI_NATIVE/$NATIVE_MODERN" | cut -d ' ' -f 1)
 	glibc=$(native_glibc_gereksinimi "$YENI_NATIVE/$NATIVE_MODERN")
 	[[ $glibc =~ ^[0-9]+\.[0-9]+$ ]] || hata "native'in glibc gereksinimi okunamadı"
@@ -288,6 +353,40 @@ native_derle() {
 	YENI_NATIVE=
 	onbellek_tamam || hata "önbelleğe yazılan native doğrulanamadı: $NATIVE_DIZINI"
 	bilgi "native derlendi: $sure sn, glibc >= $glibc, $NATIVE_VARLIK $(boyut "$NATIVE_DIZINI/$NATIVE_VARLIK")"
+}
+
+# tara <ad> <dosya> <yama|duz>: yayına girecek satırları $GECICI/gizli-desenler'e karşı tarar: yamada eklenen
+# satırlar (baştaki + olmadan) ve dosya başlıkları, düz dosyada bütün satırlar. IZINLI_SATIR_DOSYASI'ndaki bir
+# satırla birebir aynı olmayan her eşleşmeyi gösterip yayını durdurur.
+tara() {
+	local kod=0
+	rm -f -- "$GECICI/bildirilecek"
+	LC_ALL=C awk -v tur="$3" -v yer="$GECICI/tarama-yer" '
+		tur == "duz" { print; print FNR >yer; next }
+		/^diff --git / { baslik = 1 }
+		/^@@ / { baslik = 0 }
+		baslik && /^(diff --git |rename (from|to) |--- |\+\+\+ )/ { print; print FNR >yer }
+		!baslik && /^\+/ { print substr($0, 2); print FNR >yer }' "$2" >"$GECICI/tarama"
+	# -a ve LC_ALL=C: NUL ya da geçersiz UTF-8 içeren satırlar ikili sayılıp sonraki eşleşmeler atlanmasın.
+	LC_ALL=C grep -anE -f "$GECICI/gizli-desenler" "$GECICI/tarama" >"$GECICI/supheli" || kod=$?
+	((kod <= 1)) || hata "gizlilik taraması çalışmadı (grep çıkış kodu $kod)"
+	((kod == 0)) || return 0
+	LC_ALL=C awk -v ad="$1" -v izinli="$IZINLI_SATIR_DOSYASI" -v yer="$GECICI/tarama-yer" \
+		-v cikti="$GECICI/bildirilecek" '
+		BEGIN {
+			while ((getline s <izinli) > 0) if (s != "" && s !~ /^#/) izin[s] = 1
+			while ((getline s <yer) > 0) no[++n] = s
+		}
+		{
+			i = index($0, ":")
+			s = substr($0, i + 1)
+			if (s in izin) next
+			printf "  %s:%s: %s\n", ad, no[substr($0, 1, i - 1)], substr(s, 1, 300) >"/dev/stderr"
+			print s >cikti
+		}' "$GECICI/supheli"
+	[[ -s $GECICI/bildirilecek ]] || return 0
+	install -m 600 -- "$GECICI/bildirilecek" "$ONBELLEK/supheli-satirlar"
+	hata "$1 içinde ev dizini yolu ya da gizli anahtara benzeyen satırlar var (yukarıda, satır numarasıyla). Yanlış alarmsa bu satırları $ONBELLEK/supheli-satirlar dosyasından olduğu gibi $IZINLI_SATIR_DOSYASI dosyasına ekle"
 }
 
 # readme_blogu: README'deki yamalar bloğunun içeriği.
@@ -341,18 +440,18 @@ release_olustur() {
 	local -a olustur=(gh release create "$RELEASE_ETIKETI" --repo "$OMP_YAMALARI_GH" --verify-tag
 		--title "native ${NATIVE_ANAHTAR:0:12}" --notes-file "$notlar" "$NATIVE_DIZINI/$NATIVE_VARLIK")
 	release_notlari >"$notlar"
-	if [[ -z $(git -C "$REPO" ls-remote origin "refs/tags/$RELEASE_ETIKETI") ]]; then
-		git -C "$REPO" push -q origin "HEAD:refs/tags/$RELEASE_ETIKETI" || hata "$RELEASE_ETIKETI etiketi push edilemedi"
+	if [[ -z $(git -C "$REPO" ls-remote origin "refs/tags/$RELEASE_ETIKETI" 9>&-) ]]; then
+		git -C "$REPO" push -q origin "HEAD:refs/tags/$RELEASE_ETIKETI" 9>&- || hata "$RELEASE_ETIKETI etiketi push edilemedi"
 	fi
 	bilgi "GitHub Releases: $RELEASE_ETIKETI oluşturuluyor, $NATIVE_VARLIK yükleniyor"
-	"${olustur[@]}" >/dev/null && return 0
+	"${olustur[@]}" >/dev/null 9>&- && return 0
 	# GitHub, hiç dalı olmayan yepyeni repoda release açmayı reddedebilir. Böyle bir repodan kurulmuş arkadaş
 	# olamayacağı için yalnız o ilk yayında main önce gönderilir ve release bir kez daha denenir.
-	dallar=$(git -C "$REPO" ls-remote --heads origin) || hata "origin okunamadı"
+	dallar=$(git -C "$REPO" ls-remote --heads origin 9>&-) || hata "origin okunamadı"
 	[[ -z $dallar ]] || hata "gh release create başarısız"
 	bilgi "repoda henüz dal yok: önce main gönderiliyor, release yeniden deneniyor"
-	git -C "$REPO" push -q origin main || hata "git push origin main başarısız"
-	"${olustur[@]}" >/dev/null || hata "gh release create başarısız"
+	git -C "$REPO" push -q origin main 9>&- || hata "git push origin main başarısız"
+	"${olustur[@]}" >/dev/null 9>&- || hata "gh release create başarısız"
 }
 
 # dogrula: push'tan sonra yayını arkadaşın göreceği gibi denetler.
@@ -360,18 +459,18 @@ dogrula() {
 	local yerel uzak indirme klon=$GECICI/klon agac
 	bilgi "doğrulanıyor: origin main, native indirme adresi, taze klondaki yama"
 	yerel=$(git -C "$REPO" rev-parse HEAD)
-	uzak=$(git -C "$REPO" ls-remote origin refs/heads/main | cut -f 1)
+	uzak=$(git -C "$REPO" ls-remote origin refs/heads/main 9>&- | cut -f 1)
 	[[ $uzak == "$yerel" ]] || hata "origin main ($uzak) yerel HEAD ($yerel) değil"
 	if [[ $NATIVE_KAYNAK == npm ]]; then
-		indirme=$(npm_native_bilgi "$NATIVE_NPM_SURUM") || hata "npm'de $NPM_NATIVE_PAKETI@$NATIVE_NPM_SURUM bulunamadı"
-		indirme=${indirme%% *}
+		npm_native_sorgula "$NATIVE_NPM_SURUM" || hata "npm'de $NPM_NATIVE_PAKETI@$NATIVE_NPM_SURUM bulunamadı"
+		indirme=$NPM_TARBALL
 	else
 		indirme=$NATIVE_URL
 	fi
-	curl -fsSIL -o /dev/null "$indirme" || hata "native indirilemiyor: $indirme"
-	git clone -q --depth 1 --branch main "$(git -C "$REPO" remote get-url origin)" "$klon" || hata "repo klonlanamadı"
+	curl -fsSIL -o /dev/null "$indirme" 9>&- || hata "native indirilemiyor: $indirme"
+	git clone -q --depth 1 --branch main "$(git -C "$REPO" remote get-url origin)" "$klon" 9>&- || hata "repo klonlanamadı"
 	cmp -s -- "$klon/yama.env" "$REPO/yama.env" || hata "klondaki yama.env yereldekiyle aynı değil"
-	agac=$(yama_agaci "$GITDIR" "$TABAN" "$klon/yamalar.patch") || hata "klondaki yamalar.patch TABAN'a uygulanamadı"
+	agac=$(yama_agaci "$GITDIR" "$TABAN" "$klon/yamalar.patch" 9>&-) || hata "klondaki yamalar.patch TABAN'a uygulanamadı"
 	[[ $agac == "$AGAC" ]] || hata "klondaki yamalar.patch AGAC'ı vermiyor ($agac)"
 }
 
@@ -430,8 +529,14 @@ for arac in git curl zstd objdump flock sha256sum numfmt; do
 	command -v "$arac" >/dev/null || hata "$arac bulunamadı"
 done
 mkdir -p -- "$ONBELLEK/native"
+# Gerçek yol: git worktree kayıtlarını symlink'siz yolla tutar, artiklari_temizle onlarla karşılaştırır.
+ONBELLEK=$(cd -- "$ONBELLEK" && pwd -P)
+DERLEME_GUNLUGU=$ONBELLEK/derleme.log
+# Ağa çıkan ya da uzun süren alt süreçler kilit kapalı (9>&-) başlatılır: arkada kalan bir süreç (git'in eksik
+# nesne çekerken bile başlattığı `maintenance run --detach`, bir derleme sunucusu) betik bitince kilidi tutmasın.
 exec 9>"$ONBELLEK/kilit"
 flock -n 9 || hata "başka bir yayinla.sh çalışıyor (kilit: $ONBELLEK/kilit)"
+artiklari_temizle
 GECICI=$(mktemp -d "${TMPDIR:-/tmp}/yayinla.XXXXXX")
 
 GITDIR=$(git -C "$OMP_KAYNAK" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
@@ -442,7 +547,7 @@ if [[ -n $kirli ]]; then
 	hata "$OMP_KAYNAK içinde commit edilmemiş değişiklikler var (yukarıda); yayın HEAD'den yapılır, önce commit et"
 fi
 if ((KURU)); then
-	if ! command -v gh >/dev/null || ! gh auth status >/dev/null 2>&1; then
+	if ! command -v gh >/dev/null || ! gh auth status >/dev/null 2>&1 9>&-; then
 		GH_VAR=0
 		bilgi "uyarı: gh yok ya da oturum açık değil; GitHub Releases denetlenmeyecek"
 	fi
@@ -451,17 +556,17 @@ else
 fi
 
 bilgi "omp kaynağı güncelleniyor: git -C $OMP_KAYNAK fetch origin"
-git -C "$OMP_KAYNAK" fetch -q origin || hata "git fetch origin başarısız"
+git -C "$OMP_KAYNAK" fetch -q origin 9>&- || hata "git fetch origin başarısız"
 UPSTREAM_URL=$(git -C "$OMP_KAYNAK" remote get-url origin)
-etiketler=$(kararli_etiketler "$UPSTREAM_URL") || etiketler=
-mapfile -t SON_ETIKETLER < <(printf '%s\n' "$etiketler" | sed '/^$/d' | tail -n 10 | tac)
-((${#SON_ETIKETLER[@]})) || bilgi "uyarı: upstream'in kararlı sürüm etiketleri okunamadı"
+etiketler=$(kararli_etiketler "$UPSTREAM_URL" 9>&-) ||
+	hata "upstream'in kararlı sürüm etiketleri okunamadı ($UPSTREAM_URL); etiketsiz aramak npm'deki native'i atlayabilir"
+mapfile -t SON_ETIKETLER < <(tail -n 10 <<<"$etiketler" | tac)
 eksik=()
 for t in "${SON_ETIKETLER[@]}"; do
 	git -C "$OMP_KAYNAK" rev-parse -q --verify "refs/tags/$t^{commit}" >/dev/null || eksik+=("refs/tags/$t:refs/tags/$t")
 done
 if ((${#eksik[@]})); then
-	git -C "$OMP_KAYNAK" fetch -q --no-tags origin "${eksik[@]}" || bilgi "uyarı: upstream etiketleri çekilemedi: ${eksik[*]}"
+	git -C "$OMP_KAYNAK" fetch -q --no-tags origin "${eksik[@]}" 9>&- || hata "upstream etiketleri çekilemedi: ${eksik[*]}"
 fi
 
 YAMALI_COMMIT=$(git -C "$OMP_KAYNAK" rev-parse --verify 'HEAD^{commit}')
@@ -475,25 +580,18 @@ SURUM=$(git -C "$OMP_KAYNAK" show "$YAMALI_COMMIT:packages/utils/package.json" |
 bilgi "omp $SURUM: HEAD ${YAMALI_COMMIT:0:12}, TABAN ${TABAN:0:12} (HEAD ile origin/main'in ortak atası)"
 
 YAMA=$GECICI/yamalar.patch
-yama_uret "$GITDIR" "$TABAN" "$YAMALI_COMMIT" >"$YAMA"
+yama_uret "$GITDIR" "$TABAN" "$YAMALI_COMMIT" >"$YAMA" 9>&-
 {
-	printf '^\\+.*(%s)\n' "$GIZLI_DESEN"
-	[[ ! -f $GIZLI_DESEN_DOSYASI ]] || sed '/^[[:space:]]*$/d; /^#/d; s/.*/^\\+.*(&)/' "$GIZLI_DESEN_DOSYASI"
+	printf '%s\n' "${GIZLI_DESENLER[@]}"
+	[[ ! -f $GIZLI_DESEN_DOSYASI ]] || sed 's/\r$//; /^[[:space:]]*$/d; /^#/d' "$GIZLI_DESEN_DOSYASI"
 } >"$GECICI/gizli-desenler"
-# -a ve LC_ALL=C: NUL ya da geçersiz UTF-8 içeren yama ikili sayılıp sonraki eşleşmeler atlanmasın.
-tarama=0
-LC_ALL=C grep -anE -f "$GECICI/gizli-desenler" "$YAMA" >"$GECICI/supheli" || tarama=$?
-((tarama <= 1)) || hata "gizlilik taraması çalışmadı (grep çıkış kodu $tarama)"
-if ((tarama == 0)); then
-	cut -c 1-240 "$GECICI/supheli" >&2
-	hata "yamada ev dizini yolu ya da gizli anahtara benzeyen eklenmiş satırlar var (yukarıda, yamalar.patch satır numarasıyla)"
-fi
-agac=$(yama_agaci "$GITDIR" "$TABAN" "$YAMA") || hata "yamalar.patch TABAN'a uygulanamadı"
+tara yamalar.patch "$YAMA" yama
+agac=$(yama_agaci "$GITDIR" "$TABAN" "$YAMA" 9>&-) || hata "yamalar.patch TABAN'a uygulanamadı"
 [[ $agac == "$AGAC" ]] || hata "TABAN + yamalar.patch ağacı ($agac) HEAD'in ağacı ($AGAC) değil"
 bilgi "yama doğrulandı: $(wc -c <"$YAMA") bayt; TABAN + yamalar.patch = AGAC ${AGAC:0:12}"
 
-NATIVE_ANAHTAR=$(native_anahtar "$GITDIR" "$YAMALI_COMMIT")
-[[ $NATIVE_ANAHTAR =~ ^[0-9a-f]{64}$ ]] || hata "native anahtarı hesaplanamadı"
+NATIVE_ANAHTAR=$(native_anahtar "$GITDIR" "$YAMALI_COMMIT" 9>&-) && [[ $NATIVE_ANAHTAR =~ ^[0-9a-f]{64}$ ]] ||
+	hata "native anahtarı hesaplanamadı"
 RELEASE_ETIKETI=native-${NATIVE_ANAHTAR:0:12}
 NATIVE_DIZINI=$ONBELLEK/native/$NATIVE_ANAHTAR
 ONCEKI=$GECICI/onceki.env
@@ -526,7 +624,8 @@ else
 	ZAMAN_NOTU=yeni
 fi
 
-readme_uret >"$GECICI/README.md"
+readme_uret >"$GECICI/README.md" 9>&-
+tara "README.md (yamalar bloğu)" "$GECICI/readme-blogu" duz
 cp -- "$YAMA" "$REPO/yamalar.patch"
 manifest_yaz >"$REPO/yama.env"
 cp -- "$GECICI/README.md" "$REPO/README.md"
@@ -541,9 +640,11 @@ if ((KURU)); then
 fi
 
 SONUC=degisiklik-yok
+# Çalışma sürerken (native derlemesi dakikalar sürebilir) repoya başka dosya eklenmiş olabilir.
+repo_dosyalarini_denetle
 git -C "$REPO" add -A
 if ! git -C "$REPO" diff --cached --quiet; then
-	git -C "$REPO" commit -q -m "yayın: omp $SURUM ($YAYIN_ZAMANI)"
+	git -C "$REPO" commit -q -m "yayın: omp $SURUM ($YAYIN_ZAMANI)" 9>&-
 	bilgi "commit: $(git -C "$REPO" log -1 --format='%h %s')"
 	SONUC=yayinlandi
 fi
@@ -551,9 +652,9 @@ if ((RELEASE_GEREK)); then
 	release_olustur
 	SONUC=yayinlandi
 fi
-if [[ $(git -C "$REPO" ls-remote origin refs/heads/main | cut -f 1) != "$(git -C "$REPO" rev-parse HEAD)" ]]; then
+if [[ $(git -C "$REPO" ls-remote origin refs/heads/main 9>&- | cut -f 1) != "$(git -C "$REPO" rev-parse HEAD)" ]]; then
 	bilgi "push: origin main"
-	git -C "$REPO" push -q origin main || hata "git push origin main başarısız"
+	git -C "$REPO" push -q origin main 9>&- || hata "git push origin main başarısız"
 	SONUC=yayinlandi
 fi
 dogrula

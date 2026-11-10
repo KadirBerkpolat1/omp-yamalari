@@ -16,8 +16,8 @@ manifest_oku() {
 
 # yama_uret <git-dir> <taban> <commit>: taban ile commit arasındaki ağaç farkı; kullanıcının git ayarlarından bağımsız.
 yama_uret() {
-	git --git-dir="$1" -c core.quotePath=false diff --binary --full-index --find-renames \
-		--no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ "$2" "$3"
+	git --git-dir="$1" -c core.quotePath=false -c core.attributesFile=/dev/null diff --binary --full-index --find-renames \
+		-U3 -O/dev/null --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ "$2" "$3"
 }
 
 # yama_agaci <git-dir> <taban> <yama-dosyası>: yamayı tabanın ağacına geçici bir index'te uygular, sonuç ağacını basar.
@@ -53,15 +53,15 @@ sabit_commit() {
 # çalışma alanı paketlerinin (source satırı olmayan) sürümlerini değiştirir; ikisi de yok sayılır.
 native_anahtar() {
 	local g=$1 c=$2 agac toml kilit
-	agac=$(git --git-dir="$g" ls-tree -r --full-tree "$c" -- crates rust-toolchain.toml .cargo \
+	agac=$(git --git-dir="$g" -c core.quotePath=false ls-tree -r --full-tree "$c" -- crates rust-toolchain.toml .cargo \
 		packages/natives/scripts/build-bindings.ts scripts/host-detect.ts scripts/bazel-natives.ts) || return 1
 	toml=$(git --git-dir="$g" cat-file blob "$c:Cargo.toml") || return 1
 	kilit=$(git --git-dir="$g" cat-file blob "$c:Cargo.lock") || return 1
 	{
 		printf '%s\n--- Cargo.toml\n' "$agac"
-		printf '%s\n' "$toml" | grep -v '^version = "'
+		printf '%s\n' "$toml" | LC_ALL=C grep -v '^version = "'
 		printf -- '--- Cargo.lock\n'
-		printf '%s\n' "$kilit" | awk 'BEGIN { RS = ""; ORS = "\n\n" } !/\nsource = / { gsub(/\nversion = "[^"]*"/, "") } { print }'
+		printf '%s\n' "$kilit" | LC_ALL=C awk 'BEGIN { RS = ""; ORS = "\n\n" } { sub(/\n+$/, "") } !/\nsource = / { gsub(/\nversion = "[^"]*"/, "") } { print }'
 	} | sha256sum | cut -d ' ' -f 1
 }
 

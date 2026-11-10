@@ -9,7 +9,7 @@
 
 ## Kurulum
 
-Gerekenler: Linux x86_64, `git` 2.38+, `curl`, `zstd`, `tar`, `flock` (util-linux), `bun` 1.4.4+ (yoksa `~/.bun` içine kurulur), en az 3 GB boş alan. Releases'tan gelen native, yayınlayanın glibc sürümünü (bkz. aşağıdaki "Yamalar" bölümü) ve x86-64-v3 (AVX2) işlemci ister; sistem eskiyse önce `sudo pacman -Syu`.
+Gerekenler: Linux x86_64, `git` 2.38+, `curl`, `zstd`, `tar`, `flock` (util-linux), `bun` 1.4.4+, en az 3 GB boş alan. bun yoksa resmî kurulum betiğiyle `~/.bun` içine kurulur; o betik kabuğun ayar dosyasına (`~/.bashrc`, `~/.zshrc` ya da fish ayarı) PATH satırı ekler ve `kaldir` bunu geri almaz. Releases'tan gelen native, yayınlayanın glibc sürümünü (bkz. aşağıdaki "Yamalar" bölümü) ve x86-64-v3 (AVX2) işlemci ister; sistem eskiyse önce `sudo pacman -Syu`.
 
 ```sh
 git clone https://github.com/KadirBerkpolat1/omp-yamalari ~/.local/share/omp-yamalari/repo
@@ -26,15 +26,15 @@ Bitince omp'yi kapatıp yeniden aç.
 
 ## Kullanım
 
-omp'ye "omp'yi güncelle" demen yeter; `omp-guncelle` skill'i aşağıdaki komutları çalıştırır.
+omp'ye "omp'yi güncelle" demen yeter; `omp-guncelle` skill'i aşağıdaki komutları çalıştırır. Güncelleme birkaç dakika sürer; sonuç gelene kadar omp'yi kapatma, bitince kapatıp yeniden aç.
 
 | Komut | Ne yapar |
 |---|---|
 | `omp-yama kontrol` | Canlı sürümü, son yayını ve upstream'i karşılaştırır (`DURUM=guncel`, `guncelleme-var` ya da `upstream-yeni`); hiçbir şeyi değiştirmez |
-| `omp-yama guncelle` | Upstream'in en yeni kararlı sürümü + yamaları dener, olmazsa test edilmiş sürüme geçer |
+| `omp-yama guncelle` | Upstream'in en yeni kararlı sürümü + yamaları dener, olmazsa test edilmiş sürüme geçer; zaten bu yayının en yeni sürümündeysen orada kalır |
 | `omp-yama guncelle --test-edilmis` | Upstream'i denemeden test edilmiş sürüme geçer; geri alınmış olsa bile yeniden kurar |
 | `omp-yama geri-al` | Bir önceki sürüme döner; bırakılan sürüm bir daha kendiliğinden kurulmaz |
-| `omp-yama kaldir` | Eski `omp`'yi ve skill'i geri koyar, `~/.local/share/omp-yamalari`'yı siler |
+| `omp-yama kaldir` | Eski `omp`'yi ve skill'i geri koyar, `~/.local/share/omp-yamalari`'yı siler; önce omp'yi kapat |
 
 Komutun tam yolu `~/.local/share/omp-yamalari/repo/omp-yama`.
 
@@ -164,6 +164,8 @@ Yamalar yayınlayanın `~/Projeler/oh-my-pi` deposundaki canlı daldan gelir. O 
 ./yayinla.sh --kuru   # dosyaları üretir ve denetler; commit, push ve yükleme yapmaz
 ./yayinla.sh          # yamalar.patch, yama.env ve bu sayfayı günceller, native'i Releases'a yükler, push eder
 ```
+
+`yayinla.sh` yamanın eklenen ve başlık satırlarını ve README bloğunu ev dizini yolları, token ve anahtar biçimleri için tarar; eşleşme varsa yayın durur. Yayınlayana özel desenler repoya değil `~/.config/omp-yamalari/gizli-desenler` dosyasına yazılır; meşru bir satır `~/.config/omp-yamalari/izinli-satirlar` ile onaylanır. npm ya da upstream etiketleri geçici olarak okunamazsa yayın durur, başka bir native'e sessizce geçmez.
 
 Native için sırayla şunlara bakılır: anahtarı aynıysa önceki yayının native'i, anahtarı aynı olan bir upstream sürümünün npm paketi, aynı anahtarlı mevcut Releases dosyası. Hiçbiri yoksa native geçici bir worktree'de derlenir ve Releases'a yüklenir. Native anahtarı Rust derleme girdilerinin özetidir; sürüm atlatma satırlarını saymaz.
 
