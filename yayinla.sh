@@ -110,7 +110,7 @@ temizle() {
 
 izinli_mi() {
 	case $1 in
-	omp-yama | ortak.sh | yayinla.sh | README.md | yama.env | yamalar.patch | .gitignore | LICENSE | skill/*) return 0 ;;
+	omp-yama | ortak.sh | yayinla.sh | README.md | yama.env | yamalar.patch | .gitignore | LICENSE | skill/* | litellm/*) return 0 ;;
 	esac
 	return 1
 }
@@ -625,7 +625,10 @@ else
 fi
 
 readme_uret >"$GECICI/README.md" 9>&-
-tara "README.md (yamalar bloğu)" "$GECICI/readme-blogu" duz
+tara README.md "$GECICI/README.md" duz
+for dosya in "$REPO"/litellm/*; do
+	if [[ -f $dosya ]]; then tara "litellm/${dosya##*/}" "$dosya" duz; fi
+done
 cp -- "$YAMA" "$REPO/yamalar.patch"
 manifest_yaz >"$REPO/yama.env"
 cp -- "$GECICI/README.md" "$REPO/README.md"

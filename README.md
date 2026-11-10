@@ -6,7 +6,7 @@
 >
 > **AI agent'san:** [şu bölümdeki](#ai-agentsan) adımları sırayla uygula.
 
-- **Yalnız omp'de doğrudan Cursor kullananlar için.** Yamaların hepsi omp'nin Cursor sağlayıcısında (`cursor/...` modelleri) devreye girer. omp'yi LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsan bunlara ihtiyacın yok: düz omp soru sormayı, arka plan işlerini ve alt ajanları zaten kendisi yapar, `omp update` yeter.
+- **Yalnız omp'de doğrudan Cursor kullananlar için.** Yamaların hepsi omp'nin Cursor sağlayıcısında (`cursor/...` modelleri) devreye girer. omp'yi LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsan bunlara ihtiyacın yok: düz omp soru sormayı, arka plan işlerini ve alt ajanları zaten kendisi yapar, `omp update` yeter. Düşünme seviyeleri ve video için: [LiteLLM kullanıyorsan](#litellm-kullanıyorsan).
 - omp git kaynağından çalışır; yamalar upstream'in üstüne uygulanır.
 - Güncelleme önce upstream'in en yeni kararlı sürümünü (`vX.Y.Z` etiketi) yamalarla birleştirmeyi dener. Çakışma, native (Rust) farkı ya da test hatası olursa yayınlayanın test ettiği sürüme kalır. Yamalar kısmen uygulanmaz, doğrulanmamış sürüme geçilmez.
 - Her sürüm kendi dizininde hazırlanır ve test edilir; canlı sürüm tek bir symlink değişimiyle değişir. Açık omp oturumları eski sürümle çalışmaya devam eder, geri alma anlıktır.
@@ -28,7 +28,7 @@ Kurulum birkaç dakika sürer; agent bitti diyene kadar omp'yi kapatma. Bitince 
 
 Kullanıcın omp'yi bu yamalarla kurmanı istediyse bu adımları sırayla uygula ve kullanıcıyla Türkçe konuş. Komutları kullanıcının hesabıyla çalıştır; `sudo` gerekirse kendin çalıştırma, komutu kullanıcıya ver.
 
-0. **Yamalar işe yarar mı?** Yamalar yalnız omp'nin Cursor sağlayıcısında (`cursor/...` modelleri) devreye girer. Kullanıcı omp'yi LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsa (kendi modelinin sağlayıcısına bak; emin değilsen sor), kurmadan önce ona şunu söyle: "Bu yamalar yalnız doğrudan Cursor bağlantısında işe yarıyor; senin kurulumunda düz omp ile aynı davranacak. Yine de kurayım mı?" Kullanıcı isterse devam et.
+0. **Yamalar işe yarar mı?** Yamalar yalnız omp'nin Cursor sağlayıcısında (`cursor/...` modelleri) devreye girer. Kullanıcı omp'yi LiteLLM ya da başka bir OpenAI uyumlu sağlayıcıyla kullanıyorsa (kendi modelinin sağlayıcısına bak; emin değilsen sor), kurmadan önce ona şunu söyle: "Bu yamalar yalnız doğrudan Cursor bağlantısında işe yarıyor; senin kurulumunda düz omp ile aynı davranacak. Yine de kurayım mı?" Kullanıcı isterse devam et; istemezse bu adımlar yerine [LiteLLM kullanıyorsan](#litellm-kullanıyorsan) bölümünü uygula.
 
    **Kurulum zaten var mı?** `~/.local/share/omp-yamalari/canli` varsa kurulum yapılmıştır: kurma; güncelleme, sürüm sorusu ve geri alma için `~/.local/share/omp-yamalari/repo/skill/omp-guncelle/SKILL.md` dosyasını oku ve uygula. Depo henüz yoksa klonla (zaten varsa `git clone` hata verir; sorun değil, devam et):
    ```sh
@@ -62,6 +62,24 @@ Kullanıcın omp'yi bu yamalarla kurmanı istediyse bu adımları sırayla uygul
 omp dışında bir agent'san (Claude Code, Cursor, Codex gibi) `omp-guncelle` skill'i sende kendiliğinden yüklenmez; kullanıcı omp'yi güncellemeni istediğinde `skill/omp-guncelle/SKILL.md` dosyasını oku ve uygula.
 
 **Asla:** `omp update`, @oh-my-pi paketleri için `bun install -g` / `bun update -g`, `npm i -g` ya da omp'nin resmî kurulum betiği (hepsi yamasız omp kurar); `~/.local/share/omp-yamalari` altında elle dosya düzenleme; yama çakışmasını elle çözme.
+
+## LiteLLM kullanıyorsan
+
+Yamalara gerek yok; düz omp yeter (`omp update` çalışır). [`litellm/`](litellm) dizinindeki iki dosya işine yarar:
+
+1. **Düşünme seviyeleri: [`litellm/models.yml`](litellm/models.yml).** omp, LiteLLM'deki Cursor adlı modellerin (`claude-opus-5-5-1m-fast` gibi) düşünme seviyelerini bilmiyor: `:high` ya da `:max` seçsen de seviye gönderilmiyor, sunucu hep `high` kullanıyor. Bu dosya her model için sunucunun kabul ettiği seviyeleri tanımlar.
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/omp-yamalari/main/litellm/models.yml -o /tmp/litellm-models.yml
+   ```
+   - `~/.omp/agent/models.yml` yoksa dosyayı oraya koy, `<LiteLLM adresi>` yerine sana verilen adresi yaz; anahtarı `LITELLM_API_KEY` ortam değişkenine ver ya da `apiKey` satırına yaz.
+   - Varsa yalnız `modelOverrides` bloğunu LiteLLM'i gösteren sağlayıcının altına ekle; adres ve anahtar satırlarına dokunma.
+   - Sonra `omp models refresh`; `omp models find litellm` çıktısında seviyeler (`low,medium,high,xhigh,max` gibi) görünmeli.
+2. **Video: [`litellm/video-izle.ts`](litellm/video-izle.ts).** omp'ye `video_izle` aracını ekler: yerel video dosyalarını sunucudaki Gemini'ye izletir ve görüntü, ekrandaki yazı, konuşma, müzik ve ses hakkındaki soruyu yanıtlatır. En çok 5 video, her biri en çok 15 MB, toplam 20 MB; büyükse araç küçültmek için bir ffmpeg komutu önerir. Adresi ve anahtarı omp'nin `litellm` sağlayıcısından alır (`models.yml`), yoksa `LITELLM_BASE_URL` ve `LITELLM_API_KEY` ortam değişkenlerinden. Dosyayı `~/.omp/agent/extensions/` içine koy, omp'yi yeniden aç.
+   ```sh
+   mkdir -p ~/.omp/agent/extensions && curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/omp-yamalari/main/litellm/video-izle.ts -o ~/.omp/agent/extensions/video-izle.ts
+   ```
+
+AI agent'san ve kullanıcı LiteLLM kullanıyorsa: bu iki adımı onun için yap. `models.yml`'i birleştir (var olan ayarları silme), eklentiyi kopyala, `omp models refresh` çalıştır, sonra kullanıcıya omp'yi kapatıp yeniden açmasını söyle.
 
 ## Kurulum
 
